@@ -33,10 +33,14 @@ const CONFIG = {
   SPREADSHEET_ID:           "1PTW0l5hjcIAuCv25FuUP9P1h2sU_6XB6UzNZq8f01h0",
   SHEET_NAME:               "DEVIS V2026",
 
-  DROPBOX_SIGN_API_KEY:     "c1641459f892e6863a2cef9406488a9c2a6a1513452334ffa8f5d72c193d0b19",
   DROPBOX_SIGN_EMAIL_NOTIF: "nicolasbourdeix@admincie.com",
-  GEMINI_API_KEY:           "AIzaSyBYwD8Exa2_rzpPJKJo8QkaQDR-te52qMU",
-  GROQ_API_KEY:             "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",
+
+  // Clé Groq lue dans les Propriétés du script (Paramètres du projet →
+  // Propriétés du script → GROQ_API_KEY). Ne jamais la remettre en clair ici :
+  // le dépôt GitHub est public et une clé publiée est révoquée automatiquement.
+  get GROQ_API_KEY() {
+    return PropertiesService.getScriptProperties().getProperty("GROQ_API_KEY");
+  },
 
   WEBAPP_URL: "https://script.google.com/macros/s/AKfycbwy1sq6DZgPCoasIYzf9JsuWYctMGCCEJ6MiCDYI1xk4E1Wg9TDsqF4DJkTxLZzL6rh/exec",
 };
@@ -491,6 +495,9 @@ function doGet(e) {
 
   // Page de validation de contrat
   if (e.parameter.contrat) return afficherContratValidation(e.parameter.contrat);
+
+  // URL nue (sans token) : ouvrir la page de saisie plutôt que « lien expiré »
+  if (!e.parameter.token) return afficherPageSaisie();
 
   // Page de répartition salariale
   const token   = e.parameter.token || "";
@@ -1619,7 +1626,8 @@ function extraireInfosAvecBase64(base64) {
           btn.textContent = "✅ Extraction terminée";
         }, 600);
       } else {
-        setProgress(0, "Extraction partielle — remplissez manuellement.");
+        setProgress(0, "Extraction impossible — " + (data.error || "réponse vide") + " — remplissez manuellement.");
+        console.error("extraireInfosPDF :", data.error);
         document.getElementById("stepForm").style.display = "block";
         document.getElementById("formSection").style.display = "block";
         btn.disabled = false;
@@ -1841,23 +1849,30 @@ Retourne UNIQUEMENT un JSON valide sans markdown, sans backticks. Format exact :
 Si une info est absente : "" ou 0. Pour typeSpectacle : "Spectacle", "Médiation" ou "Spectacle + Médiation".
 TEXTE : ${pdfText}`;
 
+    if (!CONFIG.GROQ_API_KEY) throw new Error("Clé Groq absente : ajoutez GROQ_API_KEY dans Paramètres du projet → Propriétés du script.");
+
     const groqResp = UrlFetchApp.fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + CONFIG.GROQ_API_KEY },
       payload: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
+        // llama-3.3-70b-versatile a été retiré par Groq le 16/08/2026.
+        // Modèle surchargeable via la propriété du script GROQ_MODEL.
+        model: PropertiesService.getScriptProperties().getProperty("GROQ_MODEL") || "openai/gpt-oss-120b",
+        reasoning_effort: "low",
         messages: [
           { role: "system", content: "Tu réponds UNIQUEMENT avec un objet JSON valide, sans texte avant ni après." },
           { role: "user",   content: prompt },
         ],
         temperature: 0,
-        max_tokens: 1500,
+        max_tokens: 4000,
         response_format: { type: "json_object" },
       }),
       muteHttpExceptions: true,
     });
 
-    if (groqResp.getResponseCode() !== 200) throw new Error("Groq erreur : " + groqResp.getContentText().substring(0, 200));
+    const groqCode = groqResp.getResponseCode();
+    if (groqCode === 401) throw new Error("Clé Groq invalide ou révoquée : créez-en une nouvelle sur console.groq.com/keys et mettez-la dans la propriété du script GROQ_API_KEY.");
+    if (groqCode !== 200) throw new Error("Groq erreur [" + groqCode + "] : " + groqResp.getContentText().substring(0, 200));
 
     const groqResult = JSON.parse(groqResp.getContentText());
     const rawText    = groqResult.choices[0].message.content.trim().replace(/```json|```/g, "").trim();
