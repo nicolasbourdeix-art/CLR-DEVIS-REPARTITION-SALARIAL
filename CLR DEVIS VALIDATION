@@ -1855,13 +1855,16 @@ TEXTE : ${pdfText}`;
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + CONFIG.GROQ_API_KEY },
       payload: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
+        // llama-3.3-70b-versatile a été retiré par Groq le 16/08/2026.
+        // Modèle surchargeable via la propriété du script GROQ_MODEL.
+        model: PropertiesService.getScriptProperties().getProperty("GROQ_MODEL") || "openai/gpt-oss-120b",
+        reasoning_effort: "low",
         messages: [
           { role: "system", content: "Tu réponds UNIQUEMENT avec un objet JSON valide, sans texte avant ni après." },
           { role: "user",   content: prompt },
         ],
         temperature: 0,
-        max_tokens: 1500,
+        max_tokens: 4000,
         response_format: { type: "json_object" },
       }),
       muteHttpExceptions: true,
