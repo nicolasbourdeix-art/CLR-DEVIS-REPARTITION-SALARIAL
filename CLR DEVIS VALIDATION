@@ -1626,7 +1626,8 @@ function extraireInfosAvecBase64(base64) {
           btn.textContent = "✅ Extraction terminée";
         }, 600);
       } else {
-        setProgress(0, "Extraction partielle — remplissez manuellement.");
+        setProgress(0, "Extraction impossible — " + (data.error || "réponse vide") + " — remplissez manuellement.");
+        console.error("extraireInfosPDF :", data.error);
         document.getElementById("stepForm").style.display = "block";
         document.getElementById("formSection").style.display = "block";
         btn.disabled = false;
