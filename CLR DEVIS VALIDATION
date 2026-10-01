@@ -1,0 +1,2058 @@
+// ============================================================
+//  CONFIGURATION
+// ============================================================
+
+const CONFIG = {
+  PREFIX: "CLR-DEVIS",
+  USE_YEAR: true,
+  PADDING: 4,
+
+  COL_REFERENCE:  1,   // A
+  COL_PDF_LINK:   2,   // B
+  COL_PDF_DEVIS:  4,   // D — PDF original du devis organisateur
+  COL_DATA_START: 5,   // E
+  COL_DATA_END:   17,  // Q
+
+  FIELD_LABELS: [
+    "Quel projet ?",                                                              // E - 0
+    "Date de début du contrat",                                                   // F - 1
+    "Date de fin de contrat",                                                     // G - 2
+    "S'agit-il d'un devis concernant la vente d'un spectacle, d'une médiation ?", // H - 3
+    "Nombre d'heures facturées",                                                  // I - 4
+    "Montant de l'heure facturée",                                                // J - 5
+    "Une représentation est-elle liée à cette médiation ?",                       // K - 6
+    "Nombre de Représentations",                                                  // L - 7
+    "Prix de Cession",                                                            // M - 8
+    "Frais d'hébergement",                                                        // N - 9
+    "Frais de restauration",                                                      // O - 10
+    "Frais de déplacement",                                                       // P - 11
+    "Frais de médiation",                                                         // Q - 12
+  ],
+
+  DRIVE_FOLDER_ID:          "1c_b_kmxqp1916SDaQ-nreuhZ9V5Y-hOe",
+  SPREADSHEET_ID:           "1PTW0l5hjcIAuCv25FuUP9P1h2sU_6XB6UzNZq8f01h0",
+  SHEET_NAME:               "DEVIS V2026",
+
+  DROPBOX_SIGN_API_KEY:     "c1641459f892e6863a2cef9406488a9c2a6a1513452334ffa8f5d72c193d0b19",
+  DROPBOX_SIGN_EMAIL_NOTIF: "nicolasbourdeix@admincie.com",
+  GEMINI_API_KEY:           "AIzaSyBYwD8Exa2_rzpPJKJo8QkaQDR-te52qMU",
+  GROQ_API_KEY:             "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",
+
+  WEBAPP_URL: "https://script.google.com/macros/s/AKfycbwy1sq6DZgPCoasIYzf9JsuWYctMGCCEJ6MiCDYI1xk4E1Wg9TDsqF4DJkTxLZzL6rh/exec",
+};
+
+// ============================================================
+//  MENU
+// ============================================================
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("⚙️ AMIIS")
+    .addItem("🔄 Retraiter la ligne sélectionnée",          "retraiterLigne")
+    .addItem("🧪 Tester avec la dernière ligne",            "testerAvecDerniereLigne")
+    .addSeparator()
+    .addItem("📧 Renvoyer le contrat (ligne sélectionnée)", "renvoyerContrat")
+    .addSeparator()
+    .addItem("⏰ Installer le trigger rappels",             "installTriggerRappel")
+    .addItem("⏰ Installer le trigger onFormSubmit",        "installTrigger")
+    .addToUi();
+}
+
+// ============================================================
+//  RENVOYER LE CONTRAT
+// ============================================================
+
+function renvoyerContrat() {
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+  const ui    = SpreadsheetApp.getUi();
+
+  const response = ui.prompt("Renvoyer le contrat", "Entrez le numéro de ligne :", ui.ButtonSet.OK_CANCEL);
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const row = parseInt(response.getResponseText().trim());
+  if (isNaN(row) || row < 2 || row > sheet.getLastRow()) {
+    ui.alert("❌ Ligne " + row + " invalide.");
+    return;
+  }
+
+  const reference = sheet.getRange(row, CONFIG.COL_REFERENCE).getValue();
+  if (!reference) {
+    ui.alert("❌ Pas de référence en ligne " + row + " — traitez d'abord cette ligne.");
+    return;
+  }
+
+  const nomProjet = sheet.getRange(row, 5).getValue();
+  const confirm   = ui.alert(
+    "Renvoyer le contrat pour :\n" + nomProjet + " (" + reference + ") ?",
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (confirm !== ui.Button.OK) return;
+
+  try {
+    const rowData = getRowData(sheet, row);
+    genererContratCession(ss, sheet, row, rowData, reference);
+    ui.alert("✅ Mail de contrat renvoyé pour " + reference + " !");
+  } catch (err) {
+    ui.alert("❌ Erreur : " + err.message);
+    Logger.log("❌ renvoyerContrat : " + err.message);
+  }
+}
+
+// ============================================================
+//  DÉCLENCHEUR PRINCIPAL onFormSubmit
+// ============================================================
+
+function onFormSubmit(e) {
+  if (!e || !e.range) {
+    SpreadsheetApp.getUi().alert(
+      "⚠️ Ce script ne peut pas être exécuté manuellement.\n\n" +
+      "Utilisez 'testerAvecDerniereLigne' pour tester."
+    );
+    return;
+  }
+
+  try {
+    const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getActiveSheet();
+    const row   = e.range.getRow();
+
+    // 1. Générer la référence
+    const reference = generateReference(sheet, row);
+    sheet.getRange(row, CONFIG.COL_REFERENCE).setValue(reference);
+
+    // 2. Lire les données
+    const rowData = getRowData(sheet, row);
+
+    // 3. Créer le PDF récap DPAE
+    const pdfResult = createDevisPDF(reference, rowData);
+
+    // 4. Écrire le lien PDF récap en colonne B
+    const richText = SpreadsheetApp.newRichTextValue()
+      .setText("📄 Recap Devis validé")
+      .setLinkUrl(pdfResult.url)
+      .build();
+    sheet.getRange(row, CONFIG.COL_PDF_LINK).setRichTextValue(richText);
+
+    // 5. Envoyer le mail au porteur
+    const detail = {
+      cession:    pdfResult.cession,
+      heberg:     pdfResult.heberg,
+      resto:      pdfResult.resto,
+      deplac:     pdfResult.deplac,
+      margeFixe:  pdfResult.margeFixe,
+      posteAdm:   pdfResult.posteAdm,
+      posteDiff:  pdfResult.posteDiff,
+      nbRepresen: pdfResult.nbRepresen,
+      honoraires: pdfResult.honoraires,
+      heures:     pdfResult.heures,
+      tarifHeure: pdfResult.tarifHeure,
+      dateDebut:  rowData.fields[1].value,
+      dateFin:    rowData.fields[2].value,
+    };
+    envoyerMailPorteur(ss, rowData.fields[0].value, reference, pdfResult.url, pdfResult.blob, row, pdfResult.totalNet, detail);
+
+    // 6. Générer le contrat si col S (19) = "Oui"
+    if (String(sheet.getRange(row, 19).getValue()).trim().toLowerCase() === "oui") {
+      Utilities.sleep(3000);
+      genererContratCession(ss, sheet, row, rowData, reference);
+    }
+
+    Logger.log("✅ Devis créé : " + reference + " | Ligne " + row);
+
+  } catch (err) {
+    Logger.log("❌ onFormSubmit : " + err.message + "\n" + err.stack);
+  }
+}
+
+// ============================================================
+//  FONCTIONS DE TEST / RETRAITEMENT
+// ============================================================
+
+function testerAvecDerniereLigne() {
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getActiveSheet();
+  if (sheet.getLastRow() < 2) { Logger.log("❌ Aucune donnée."); return; }
+  onFormSubmit({ range: sheet.getRange(sheet.getLastRow(), 1) });
+}
+
+function retraiterLigne() {
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME) || ss.getActiveSheet();
+  const colE  = sheet.getRange("E:E").getValues();
+  let row = 2;
+  for (let i = colE.length - 1; i >= 1; i--) {
+    if (colE[i][0] && String(colE[i][0]).trim() !== "") { row = i + 1; break; }
+  }
+  if (row < 2 || row > sheet.getLastRow()) {
+    SpreadsheetApp.getUi().alert("❌ Aucune ligne valide trouvée.");
+    return;
+  }
+  const nomProjet = sheet.getRange(row, CONFIG.COL_DATA_START).getValue();
+  if (!nomProjet) { SpreadsheetApp.getUi().alert("❌ Pas de données ligne " + row); return; }
+
+  const confirm = SpreadsheetApp.getUi().alert(
+    "Retraiter la ligne " + row + " ?",
+    "Projet : \"" + nomProjet + "\"",
+    SpreadsheetApp.getUi().ButtonSet.OK_CANCEL
+  );
+  if (confirm !== SpreadsheetApp.getUi().Button.OK) return;
+
+  onFormSubmit({ range: sheet.getRange(row, 1) });
+  SpreadsheetApp.getUi().alert("✅ Ligne " + row + " retraitée !");
+}
+
+// ============================================================
+//  GÉNÉRATION DE RÉFÉRENCE
+// ============================================================
+
+function generateReference(sheet, currentRow) {
+  let maxNum = 0;
+  for (let r = 2; r <= sheet.getLastRow(); r++) {
+    if (r === currentRow) continue;
+    const cell = String(sheet.getRange(r, CONFIG.COL_REFERENCE).getValue() || "");
+    const num  = parseInt(cell.replace(/[^0-9]/g, "").slice(-CONFIG.PADDING), 10);
+    if (!isNaN(num) && num > maxNum) maxNum = num;
+  }
+  const nextNum = String(maxNum + 1).padStart(CONFIG.PADDING, "0");
+  const year    = CONFIG.USE_YEAR ? new Date().getFullYear() : null;
+  return [CONFIG.PREFIX, year, nextNum].filter(Boolean).join("-");
+}
+
+// ============================================================
+//  LECTURE DES DONNÉES DE LA LIGNE
+// ============================================================
+
+function getRowData(sheet, row) {
+  const numCols   = CONFIG.COL_DATA_END - CONFIG.COL_DATA_START + 1;
+  const values    = sheet.getRange(row, CONFIG.COL_DATA_START, 1, numCols).getValues()[0];
+  const timestamp = sheet.getRange(row, 1).getValue();
+
+  return {
+    timestamp: timestamp
+      ? Utilities.formatDate(new Date(timestamp), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm")
+      : "",
+    fields: values.map((val, i) => {
+      let formatted = "";
+      if (val instanceof Date)                   formatted = Utilities.formatDate(val, Session.getScriptTimeZone(), "dd/MM/yyyy");
+      else if (val !== undefined && val !== null) formatted = String(val);
+      return { label: CONFIG.FIELD_LABELS[i] || "Champ " + (i + 1), value: formatted };
+    }),
+  };
+}
+
+// ============================================================
+//  CRÉATION DU PDF RÉCAP DPAE
+// ============================================================
+
+function createDevisPDF(reference, rowData) {
+  const heures      = parseFloat(rowData.fields[4].value)  || 0;
+  const tarifHeure  = parseFloat(rowData.fields[5].value)  || 0;
+  const nbRepresen  = parseFloat(rowData.fields[7].value)  || 0;
+  const prixCession = parseFloat(rowData.fields[8].value)  || 0;
+  const fraisHeberg = parseFloat(rowData.fields[9].value)  || 0;
+  const fraisResto  = parseFloat(rowData.fields[10].value) || 0;
+  const fraisDeplac = parseFloat(rowData.fields[11].value) || 0;
+  const fraisMediation = parseFloat(rowData.fields[12] ? rowData.fields[12].value : 0) || 0;
+
+  const honoraires = heures * tarifHeure;
+  const sousTotal  = honoraires + prixCession + fraisHeberg + fraisResto + fraisDeplac + fraisMediation;
+  const margeFixe  = 58 * nbRepresen;
+  const posteAdm   = 85;
+  const posteDiff  = 85;
+  const totalFrais = margeFixe + posteAdm + posteDiff;
+  const totalNet   = sousTotal - totalFrais;
+
+  const total = sousTotal > 0 ? {
+    brut: sousTotal, frais: totalFrais, net: totalNet,
+    honoraires, heures, tarifHeure,
+    cession: prixCession, heberg: fraisHeberg, resto: fraisResto,
+    deplac: fraisDeplac, mediation: fraisMediation,
+    margeFixe, posteAdm, posteDiff, nbRepresen,
+  } : null;
+
+  const htmlContent = buildDevisHTML(reference, rowData, total);
+  const pdfBlob     = htmlToPDF(htmlContent, "Devis_" + reference);
+
+  const pdfFile = sauvegarderFichierDrive(pdfBlob, new Date().getFullYear().toString());
+  pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+  return {
+    url:        pdfFile.getUrl(),
+    blob:       pdfBlob,
+    totalNet:   total ? total.net        : 0,
+    cession:    total ? total.cession    : 0,
+    heberg:     total ? total.heberg     : 0,
+    resto:      total ? total.resto      : 0,
+    deplac:     total ? total.deplac     : 0,
+    margeFixe:  total ? total.margeFixe  : 0,
+    posteAdm:   total ? total.posteAdm   : 0,
+    posteDiff:  total ? total.posteDiff  : 0,
+    nbRepresen: total ? total.nbRepresen : 0,
+    honoraires: total ? total.honoraires : 0,
+    heures:     total ? total.heures     : 0,
+    tarifHeure: total ? total.tarifHeure : 0,
+  };
+}
+
+// ============================================================
+//  UTILITAIRES DRIVE
+// ============================================================
+
+/** Convertit du HTML en PDF via l'API Drive (upload → export → delete). */
+function htmlToPDF(htmlContent, fileName) {
+  const oauthToken = ScriptApp.getOAuthToken();
+  const boundary   = "-------314159265358979323846";
+  const delimiter  = "\r\n--" + boundary + "\r\n";
+  const closeDelim = "\r\n--" + boundary + "--";
+  const meta       = JSON.stringify({ name: "_tmp_" + fileName, mimeType: "application/vnd.google-apps.document" });
+
+  const body = delimiter + "Content-Type: application/json\r\n\r\n" + meta
+             + delimiter + "Content-Type: text/html\r\n\r\n" + htmlContent
+             + closeDelim;
+
+  const uploadResp = UrlFetchApp.fetch(
+    "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+    { method: "POST", headers: { "Authorization": "Bearer " + oauthToken, "Content-Type": "multipart/related; boundary=" + boundary }, payload: body, muteHttpExceptions: true }
+  );
+  const tmpId = JSON.parse(uploadResp.getContentText()).id;
+
+  const exportResp = UrlFetchApp.fetch(
+    "https://www.googleapis.com/drive/v3/files/" + tmpId + "/export?mimeType=application/pdf",
+    { headers: { "Authorization": "Bearer " + oauthToken }, muteHttpExceptions: true }
+  );
+  const blob = exportResp.getBlob();
+  blob.setName(fileName + ".pdf");
+
+  UrlFetchApp.fetch("https://www.googleapis.com/drive/v3/files/" + tmpId, {
+    method: "DELETE", headers: { "Authorization": "Bearer " + oauthToken }, muteHttpExceptions: true,
+  });
+
+  return blob;
+}
+
+/** Sauvegarde un blob dans un sous-dossier année du dossier principal. */
+function sauvegarderFichierDrive(blob, sousDossier) {
+  const racine       = DriveApp.getFolderById(CONFIG.DRIVE_FOLDER_ID);
+  const iter         = racine.getFoldersByName(sousDossier);
+  const dossierAnnee = iter.hasNext() ? iter.next() : racine.createFolder(sousDossier);
+  return dossierAnnee.createFile(blob);
+}
+
+// ============================================================
+//  HTML DU RÉCAP DPAE
+// ============================================================
+
+function buildDevisHTML(reference, rowData, total) {
+  const rows = rowData.fields
+    .filter(f => f.value && f.value.trim() !== "" && f.value !== "0")
+    .map(f => `<tr><td class="question">${f.label}</td><td class="reponse">${f.value}</td></tr>`)
+    .join("");
+
+  const ligneRecap = (label, montant) => montant > 0
+    ? `<tr><td class="question">${label}</td><td class="reponse" style="text-align:right;">${montant.toFixed(2)} €</td></tr>`
+    : "";
+
+  const totalBlock = total ? `
+    <tr><td colspan="2" style="padding:2px 0;"></td></tr>
+    <tr style="background:#f8fafc;">
+      <td colspan="2" style="font-weight:700;color:#1e40af;font-size:13px;padding:5px 8px;border-top:2px solid #1e40af;border-bottom:1px solid #1e40af;">Récapitulatif du projet</td>
+    </tr>
+    ${ligneRecap("Honoraires (" + total.heures + "h × " + total.tarifHeure + " €)", total.honoraires)}
+    ${ligneRecap("Prix de Cession", total.cession)}
+    ${ligneRecap("Frais d'hébergement", total.heberg)}
+    ${ligneRecap("Frais de restauration", total.resto)}
+    ${ligneRecap("Frais de déplacement", total.deplac)}
+    <tr style="background:#e0e7ff;">
+      <td style="font-weight:700;color:#1e40af;padding:5px 8px;">SOUS-TOTAL PROJET</td>
+      <td style="font-weight:700;color:#1e40af;padding:8px 10px;text-align:right;">${total.brut.toFixed(2)} €</td>
+    </tr>
+    <tr><td colspan="2" style="padding:2px 0;"></td></tr>
+    <tr style="background:#fff7ed;">
+      <td colspan="2" style="font-weight:700;color:#c2410c;font-size:13px;padding:5px 8px;border-top:2px solid #c2410c;border-bottom:1px solid #c2410c;">Frais de fonctionnement (déduits)</td>
+    </tr>
+    <tr><td class="question">Marge Fixe Compagnie (58 € × ${total.nbRepresen} représentation(s))</td><td class="reponse" style="text-align:right;color:#c2410c;">- ${total.margeFixe.toFixed(2)} €</td></tr>
+    <tr><td class="question">Poste Diff</td><td class="reponse" style="text-align:right;color:#c2410c;">- ${total.posteDiff.toFixed(2)} €</td></tr>
+    <tr><td class="question">Poste Admin</td><td class="reponse" style="text-align:right;color:#c2410c;">- ${total.posteAdm.toFixed(2)} €</td></tr>
+    <tr style="background:#fff7ed;">
+      <td style="font-weight:700;color:#c2410c;padding:5px 8px;">TOTAL FRAIS DE FONCTIONNEMENT</td>
+      <td style="font-weight:700;color:#c2410c;padding:8px 10px;text-align:right;">- ${total.frais.toFixed(2)} €</td>
+    </tr>
+    <tr style="background:#1e40af;">
+      <td style="font-weight:700;color:#fff;padding:6px 8px;font-size:12px;">TOTAL NET DU PROJET</td>
+      <td style="font-weight:700;color:#fff;padding:6px 8px;font-size:12px;text-align:right;">${total.net.toFixed(2)} €</td>
+    </tr>` : "";
+
+  return `<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8"/>
+<style>
+  @page { margin:15mm; }
+  body { font-family:Arial,sans-serif;margin:0;color:#1f2937;font-size:11px;line-height:1.3; }
+  h1 { font-size:13px;font-weight:700;color:#1e40af;text-align:center;text-transform:uppercase;letter-spacing:1px;border-bottom:2px solid #1e40af;padding-bottom:6px;margin-bottom:4px;margin-top:0; }
+  .ref { text-align:center;font-size:10px;color:#6b7280;margin-bottom:10px; }
+  table { width:100%;border-collapse:collapse; }
+  td { vertical-align:top;padding:4px 8px;border-bottom:1px solid #e5e7eb; }
+  td.question { font-weight:600;color:#374151;width:45%; }
+  td.reponse { color:#1f2937; }
+</style></head><body>
+  <h1>Note d'info nouveaux contrats pour DPAE</h1>
+  <div class="ref">Réf. : ${reference} &nbsp;|&nbsp; Émis le ${rowData.timestamp}</div>
+  <table><tbody>${rows}${totalBlock}</tbody></table>
+</body></html>`;
+}
+
+// ============================================================
+//  ENVOI DU MAIL AU PORTEUR
+// ============================================================
+
+function envoyerMailPorteur(ss, nomProjet, reference, pdfUrl, pdfBlob, ligneDevis, totalNet, detail) {
+  const sheetCompta = ss.getSheetByName("CODE COMPTA");
+  if (!sheetCompta) { Logger.log("⚠️ Feuille 'CODE COMPTA' introuvable."); return; }
+
+  const colM        = sheetCompta.getRange("M:M").getValues();
+  const normaliser  = s => String(s).trim().toLowerCase().replace(/\s+/g, " ");
+  const nomRecherche = normaliser(nomProjet);
+  let porteurPrenom = null;
+  let porteurMail   = null;
+
+  for (let i = 0; i < colM.length; i++) {
+    if (normaliser(colM[i][0]) === nomRecherche) {
+      porteurPrenom = sheetCompta.getRange(i + 1, 20).getValue();
+      porteurMail   = sheetCompta.getRange(i + 1, 21).getValue();
+      break;
+    }
+  }
+
+  if (!porteurMail) {
+    Logger.log("⚠️ Projet \"" + nomProjet + "\" non trouvé dans CODE COMPTA — mail non envoyé.");
+    return;
+  }
+
+  const emails  = String(porteurMail).split(/[,;]/).map(e => e.trim()).filter(Boolean);
+  const emailTo = emails[0];
+  const emailCc = emails.slice(1).join(",");
+
+  const formsUrl = creerFormTemporaire(ss, nomProjet, reference, pdfUrl, ligneDevis, totalNet, detail);
+
+  const mailOptions = {
+    to:      emailTo,
+    subject: "Nouveau contrat validé — " + nomProjet + " (" + reference + ")",
+    body:
+`Bonjour ${porteurPrenom},
+
+Un nouveau contrat a été validé pour le projet : ${nomProjet}.
+Référence : ${reference}
+
+Vous trouverez en pièce jointe la note d'information relative à ce contrat.
+
+Merci de remplir le formulaire de répartition salariale :
+${formsUrl}
+
+⚠️ Ce formulaire est temporaire et sera supprimé après votre saisie.
+
+Pour consulter la note DPAE à tout moment :
+${pdfUrl}
+
+Cordialement,
+L'équipe administrative`,
+    attachments: [pdfBlob],
+  };
+  if (emailCc) mailOptions.cc = emailCc;
+
+  MailApp.sendEmail(mailOptions);
+  Logger.log("📧 Mail envoyé à " + emailTo + " pour \"" + nomProjet + "\"");
+}
+
+// ============================================================
+//  FORMULAIRE TEMPORAIRE DE RÉPARTITION SALARIALE
+// ============================================================
+
+function creerFormTemporaire(ss, nomProjet, reference, pdfUrl, ligneDevis, totalNet, detail) {
+  const token = Utilities.getUuid();
+  PropertiesService.getScriptProperties().setProperty(
+    "TOKEN_" + token,
+    JSON.stringify({
+      ligne: ligneDevis, reference, nomProjet, totalNet, detail,
+      createdAt: new Date().getTime(),
+    })
+  );
+  const url = CONFIG.WEBAPP_URL + "?token=" + token;
+  Logger.log("🌐 Page de répartition : " + url);
+  return url;
+}
+
+// ============================================================
+//  WEB APP — doGet
+// ============================================================
+
+function doGet(e) {
+  // Page de saisie manuelle
+  if (e.parameter.page === "saisie") return afficherPageSaisie();
+
+  // Page de validation de contrat
+  if (e.parameter.contrat) return afficherContratValidation(e.parameter.contrat);
+
+  // Page de répartition salariale
+  const token   = e.parameter.token || "";
+  const propVal = PropertiesService.getScriptProperties().getProperty("TOKEN_" + token);
+
+  if (!propVal) {
+    return HtmlService.createHtmlOutput(
+      `<html><body style="font-family:Arial;text-align:center;padding:60px;">
+        <h2 style="color:#991b1b;">⚠️ Ce lien est expiré ou invalide.</h2>
+        <p style="color:#6b7280;margin-top:12px;">La répartition a déjà été saisie ou le lien n'est plus actif.</p>
+      </body></html>`
+    ).setTitle("Lien expiré");
+  }
+
+  const { nomProjet, reference, totalNet, detail } = JSON.parse(propVal);
+  return HtmlService.createHtmlOutput(
+    buildRepartitionHTML(token, nomProjet, reference, totalNet, detail || {})
+  ).setTitle("Répartition salariale — " + nomProjet)
+   .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// ============================================================
+//  WEB APP — doPost
+// ============================================================
+
+function doPost(e) {
+  try {
+    let params = {};
+    if (e && e.postData) {
+      const raw = e.postData.contents || "";
+      if (e.postData.type === "application/json") {
+        try { params = JSON.parse(raw); } catch(_) {}
+      } else {
+        try { params = JSON.parse(raw); } catch(_) {
+          raw.split("&").forEach(pair => {
+            const idx = pair.indexOf("=");
+            if (idx > 0) {
+              params[decodeURIComponent(pair.substring(0, idx))] =
+                decodeURIComponent(pair.substring(idx + 1).replace(/\+/g, " "));
+            }
+          });
+        }
+      }
+    }
+    if (!params.action && e && e.parameter) params = e.parameter;
+
+    Logger.log("doPost action=" + params.action + " token=" + params.token);
+
+    if (params.action === "validerContrat") return validerEtGenererContrat(params.token);
+    if (params.action === "soumettreFormulaire") return traiterFormulaireSaisie(params);
+    if (params.action === "extrairePDF")         return extraireInfosPDF(params.pdfBase64);
+    if (params.action === "annulerContrat") {
+      PropertiesService.getScriptProperties().deleteProperty("CONTRAT_" + params.token);
+      return jsonResponse({ ok: true });
+    }
+
+    // Répartition salariale (formulaire temporaire)
+    const token   = params.token || "";
+    const propKey = "TOKEN_" + token;
+    const propVal = PropertiesService.getScriptProperties().getProperty(propKey);
+    if (!propVal) return jsonResponse({ ok: false, error: "Token invalide ou expiré" });
+
+    const { ligne, htmlFileId } = JSON.parse(propVal);
+    const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+    sheet.getRange(ligne, 30).setValue(params.cachets   || 0);
+    sheet.getRange(ligne, 31).setValue(params.services  || 0);
+    sheet.getRange(ligne, 32).setValue(params.technicien || 0);
+
+    if (htmlFileId) {
+      try { DriveApp.getFileById(htmlFileId).setTrashed(true); } catch(_) {}
+    }
+    PropertiesService.getScriptProperties().deleteProperty(propKey);
+    Logger.log("✅ Répartition enregistrée ligne " + ligne);
+    return jsonResponse({ ok: true });
+
+  } catch (err) {
+    Logger.log("❌ doPost : " + err.message + "\n" + err.stack);
+    return jsonResponse({ ok: false, error: err.message });
+  }
+}
+
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ============================================================
+//  HTML PAGE RÉPARTITION SALARIALE
+// ============================================================
+
+function buildRepartitionHTML(token, nomProjet, reference, totalNet, det) {
+  const cession    = parseFloat(det.cession)    || 0;
+  const heberg     = parseFloat(det.heberg)     || 0;
+  const resto      = parseFloat(det.resto)      || 0;
+  const deplac     = parseFloat(det.deplac)     || 0;
+  const honoraires = parseFloat(det.honoraires) || 0;
+  const heures     = parseFloat(det.heures)     || 0;
+  const tarifHeure = parseFloat(det.tarifHeure) || 0;
+  const margeFixe  = parseFloat(det.margeFixe)  || 0;
+  const posteAdm   = parseFloat(det.posteAdm)   || 0;
+  const posteDiff  = parseFloat(det.posteDiff)  || 0;
+  const nbRepresen = parseFloat(det.nbRepresen) || 0;
+  const dateDebut  = det.dateDebut || "";
+  const dateFin    = det.dateFin   || "";
+
+  const BUDGET_SEUIL = (cession > 0 && honoraires > 0) ? cession + honoraires : cession;
+
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Répartition salariale — ${nomProjet}</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:Arial,sans-serif;background:#f3f4f6;color:#1f2937;font-size:15px;}
+  .header-top{background:#fff;padding:14px 30px;text-align:center;border-bottom:3px solid #e5671a;}
+  .header{background:#1e40af;color:#fff;padding:22px 30px;text-align:center;}
+  .header h1{font-size:20px;margin-bottom:4px;}
+  .header-projet{font-size:26px;font-weight:800;display:block;margin-top:4px;}
+  .container{max-width:700px;margin:0 auto;padding:28px 20px;}
+  .card{background:#fff;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.08);margin-bottom:22px;overflow:hidden;}
+  .card-title{background:#eff6ff;border-bottom:2px solid #2563eb;padding:12px 20px;font-weight:700;color:#1e40af;font-size:14px;}
+  .field{padding:16px 20px;border-bottom:1px solid #f3f4f6;display:flex;justify-content:space-between;align-items:center;gap:16px;}
+  .field label{font-weight:600;color:#374151;flex:1;}
+  .field .tarif{font-size:12px;color:#9ca3af;margin-top:3px;}
+  select{padding:9px 12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:15px;width:100px;text-align:center;cursor:pointer;}
+  select:focus{outline:none;border-color:#2563eb;}
+  .recap{padding:16px 20px;}
+  .recap-row{display:flex;justify-content:space-between;padding:6px 0;font-size:14px;border-bottom:1px solid #f3f4f6;}
+  .recap-row.total{font-weight:700;font-size:16px;border-bottom:none;margin-top:8px;padding-top:8px;}
+  .budget-bar{padding:16px 20px;}
+  .bar-bg{background:#e5e7eb;border-radius:99px;height:14px;overflow:hidden;margin-top:8px;}
+  .bar-fill{height:14px;border-radius:99px;transition:width .4s,background .4s;}
+  .alerte{margin:0 20px 16px;padding:12px 16px;border-radius:10px;font-size:14px;font-weight:600;text-align:center;}
+  .alerte.ok{background:#dcfce7;color:#166534;}
+  .alerte.over{background:#fee2e2;color:#991b1b;}
+  .btn{display:block;width:calc(100% - 40px);margin:0 20px 20px;padding:15px;background:#1e40af;color:#fff;font-size:16px;font-weight:700;border:none;border-radius:10px;cursor:pointer;}
+  .btn:disabled{background:#9ca3af;cursor:not-allowed;}
+  .success{display:none;text-align:center;padding:50px 20px;}
+  .success h2{color:#166534;font-size:22px;margin-bottom:12px;}
+</style>
+</head>
+<body>
+<div class="header-top"><strong style="color:#1e40af;font-size:18px;">AMIIS</strong></div>
+<div class="header">
+  <h1>Répartition salariale<br/><span class="header-projet">${nomProjet}</span></h1>
+  <p>Réf. : ${reference} &nbsp;|&nbsp; Du ${dateDebut} au ${dateFin}</p>
+  <p style="margin-top:6px;font-size:13px;">Montant brut coût employeur alloué : <strong>${totalNet.toFixed(2)} €</strong></p>
+</div>
+
+<div class="container" id="formZone">
+  <div class="card">
+    <div class="card-title">💰 Détail du montant alloué</div>
+    <div class="recap">
+      ${honoraires > 0 ? `<div class="recap-row"><span>Honoraires médiation (${heures}h × ${tarifHeure.toFixed(2)} €)</span><span>${honoraires.toFixed(2)} €</span></div>` : ""}
+      ${cession   > 0 ? `<div class="recap-row"><span>Prix de Cession</span><span>${cession.toFixed(2)} €</span></div>` : ""}
+      ${heberg    > 0 ? `<div class="recap-row"><span>Frais d'hébergement</span><span>${heberg.toFixed(2)} €</span></div>` : ""}
+      ${resto     > 0 ? `<div class="recap-row"><span>Frais de restauration</span><span>${resto.toFixed(2)} €</span></div>` : ""}
+      ${deplac    > 0 ? `<div class="recap-row"><span>Frais de déplacement</span><span>${deplac.toFixed(2)} €</span></div>` : ""}
+      <div class="recap-row" style="color:#c2410c;font-size:13px;"><span>Marge Fixe Compagnie (58€ × ${nbRepresen})</span><span>- ${margeFixe.toFixed(2)} €</span></div>
+      <div class="recap-row" style="color:#c2410c;font-size:13px;"><span>Poste Diff</span><span>- ${posteDiff.toFixed(2)} €</span></div>
+      <div class="recap-row" style="color:#c2410c;font-size:13px;"><span>Poste Admin</span><span>- ${posteAdm.toFixed(2)} €</span></div>
+      <div class="recap-row total"><span>Montant brut coût employeur alloué</span><span style="color:#1e40af;">${totalNet.toFixed(2)} €</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">✏️ Saisir la répartition</div>
+    <div class="field">
+      <div><label>Cachets artiste</label><div class="tarif">235,83 € / cachet</div></div>
+      <select id="cachets" onchange="calculer()">
+        ${Array.from({length:101},(_,i)=>`<option>${i}</option>`).join("")}
+      </select>
+    </div>
+    <div class="field">
+      <div><label>Services</label><div class="tarif">80,00 € / service</div></div>
+      <select id="services" onchange="calculer()">
+        ${Array.from({length:101},(_,i)=>`<option>${i}</option>`).join("")}
+      </select>
+    </div>
+    <div class="field">
+      <div><label>Journées technicien</label><div class="tarif">235,83 € / journée</div></div>
+      <select id="technicien" onchange="calculer()">
+        ${Array.from({length:101},(_,i)=>`<option>${i}</option>`).join("")}
+      </select>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">📊 Récapitulatif</div>
+    <div class="recap">
+      <div class="recap-row"><span>Cachets artiste</span><span id="rCachets">0,00 €</span></div>
+      <div class="recap-row"><span>Services</span><span id="rServices">0,00 €</span></div>
+      <div class="recap-row"><span>Journées technicien</span><span id="rTechnicien">0,00 €</span></div>
+      <div class="recap-row total"><span>Total déclaré</span><span id="rTotal">0,00 €</span></div>
+      <div class="recap-row" style="color:#6b7280;font-size:12px;"><span>Budget net alloué</span><span id="rBudget">${totalNet.toFixed(2).replace(".",",")} €</span></div>
+      <div class="recap-row" style="font-weight:600;"><span>Reste disponible</span><span id="rReste">${totalNet.toFixed(2).replace(".",",")} €</span></div>
+    </div>
+    <div class="budget-bar">
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:#6b7280;margin-bottom:8px;">
+        <span>Utilisation du budget</span><span id="barPct">0%</span>
+      </div>
+      <div class="bar-bg"><div class="bar-fill" id="barFill" style="width:0%;background:#22c55e;"></div></div>
+    </div>
+    <div class="alerte ok" id="alerte">✅ Budget respecté</div>
+    <div class="alerte ok" id="alerteCession" style="display:none;"></div>
+  </div>
+
+  <button class="btn" id="btnEnvoyer" onclick="envoyer()">Valider la répartition</button>
+</div>
+
+<div class="success" id="successZone">
+  <h2>✅ Répartition enregistrée !</h2>
+  <p>Merci, vos données ont bien été transmises.<br/>Ce formulaire est maintenant désactivé.</p>
+</div>
+
+<script>
+const BUDGET_NET     = ${totalNet};
+const BUDGET_SEUIL   = ${BUDGET_SEUIL};
+const FRAIS_HEBERG   = ${heberg};
+const FRAIS_RESTO    = ${resto};
+const FRAIS_DEPLAC   = ${deplac};
+const TOKEN          = "${token}";
+const WEBAPP         = "${CONFIG.WEBAPP_URL}";
+
+function fmt(n){ return n.toFixed(2).replace(".",",") + " €"; }
+
+function calculer() {
+  const c = +document.getElementById("cachets").value    || 0;
+  const s = +document.getElementById("services").value   || 0;
+  const t = +document.getElementById("technicien").value || 0;
+  const mc = c * 235.83, ms = s * 80, mt = t * 235.83;
+  const total = mc + ms + mt;
+  const reste = BUDGET_NET - total;
+  const pct   = BUDGET_NET > 0 ? Math.min(total / BUDGET_NET * 100, 100) : 0;
+
+  document.getElementById("rCachets").textContent    = fmt(mc);
+  document.getElementById("rServices").textContent   = fmt(ms);
+  document.getElementById("rTechnicien").textContent = fmt(mt);
+  document.getElementById("rTotal").textContent      = fmt(total);
+  document.getElementById("rReste").textContent      = fmt(reste);
+  document.getElementById("barPct").textContent      = Math.round(pct) + "%";
+
+  const bar = document.getElementById("barFill");
+  bar.style.width      = pct + "%";
+  bar.style.background = total > BUDGET_NET ? "#ef4444" : pct > 80 ? "#f59e0b" : "#22c55e";
+
+  const alerte = document.getElementById("alerte");
+  if (total > BUDGET_NET) {
+    alerte.className = "alerte over";
+    alerte.textContent = "⚠️ Budget net dépassé de " + fmt(total - BUDGET_NET);
+  } else {
+    alerte.className = "alerte ok";
+    alerte.textContent = "✅ Budget respecté — reste " + fmt(reste);
+  }
+
+  const alerteCession = document.getElementById("alerteCession");
+  if (BUDGET_SEUIL > 0 && total > BUDGET_SEUIL) {
+    let restImpact = total - BUDGET_SEUIL, details = [];
+    for (const f of [{nom:"frais de déplacement",val:FRAIS_DEPLAC},{nom:"frais d'hébergement",val:FRAIS_HEBERG},{nom:"frais de restauration",val:FRAIS_RESTO}]) {
+      if (restImpact <= 0) break;
+      if (f.val > 0) { details.push(f.nom + " (" + fmt(Math.min(restImpact, f.val)) + ")"); restImpact -= f.val; }
+    }
+    alerteCession.style.display = "block";
+    alerteCession.className = "alerte over";
+    alerteCession.textContent = "⚠️ Dépasse le prix de cession de " + fmt(total - BUDGET_SEUIL) + (details.length ? " → " + details.join(", ") : "");
+  } else if (BUDGET_SEUIL > 0) {
+    alerteCession.style.display = "block";
+    alerteCession.className = "alerte ok";
+    alerteCession.textContent = "✅ Dans le prix de cession — reste " + fmt(BUDGET_SEUIL - total);
+  } else {
+    alerteCession.style.display = "none";
+  }
+}
+
+function envoyer() {
+  const c = document.getElementById("cachets").value;
+  const s = document.getElementById("services").value;
+  const t = document.getElementById("technicien").value;
+  const btn = document.getElementById("btnEnvoyer");
+  btn.disabled = true;
+  btn.textContent = "Envoi en cours...";
+  fetch(WEBAPP, {
+    method: "POST",
+    headers: {"Content-Type":"application/x-www-form-urlencoded"},
+    body: "token=" + encodeURIComponent(TOKEN) + "&cachets=" + c + "&services=" + s + "&technicien=" + t
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.ok) {
+      document.getElementById("formZone").style.display    = "none";
+      document.getElementById("successZone").style.display = "block";
+    } else {
+      alert("Erreur : " + (data.error || "inconnue"));
+      btn.disabled = false;
+      btn.textContent = "Valider la répartition";
+    }
+  })
+  .catch(() => {
+    alert("Erreur réseau, veuillez réessayer.");
+    btn.disabled = false;
+    btn.textContent = "Valider la répartition";
+  });
+}
+</script>
+</body></html>`;
+}
+
+// ============================================================
+//  GÉNÉRATION DU CONTRAT DE CESSION
+// ============================================================
+
+function genererContratCession(ss, sheet, row, rowData, reference) {
+  try {
+    const nomProjet      = rowData.fields[0].value;
+    const dateDebut      = rowData.fields[1].value;
+    const dateFin        = rowData.fields[2].value;
+    const nbRepresen     = rowData.fields[7].value;
+    const heures         = parseFloat(rowData.fields[4].value)  || 0;
+    const tarifHeure     = parseFloat(rowData.fields[5].value)  || 0;
+    const honoraires     = heures * tarifHeure;
+    const prixCession    = parseFloat(rowData.fields[8].value)  || 0;
+    const fraisHeberg    = parseFloat(rowData.fields[9].value)  || 0;
+    const fraisResto     = parseFloat(rowData.fields[10].value) || 0;
+    const fraisDeplac    = parseFloat(rowData.fields[11].value) || 0;
+    const fraisMediation = parseFloat(rowData.fields[12] ? rowData.fields[12].value : 0) || 0;
+    const totalContrat   = honoraires + prixCession + fraisHeberg + fraisResto + fraisDeplac + fraisMediation;
+
+    const raisonSociale  = sheet.getRange(row, 20).getValue();
+    const siret          = sheet.getRange(row, 21).getValue();
+    const formeJuridique = sheet.getRange(row, 22).getValue();
+    const adresse        = sheet.getRange(row, 23).getValue();
+    const codePostal     = sheet.getRange(row, 24).getValue();
+    const ville          = sheet.getRange(row, 25).getValue();
+    const telephone      = sheet.getRange(row, 26).getValue();
+    const signataire     = sheet.getRange(row, 27).getValue();
+    const qualite        = sheet.getRange(row, 28).getValue();
+    const emailOrga      = sheet.getRange(row, 29).getValue();
+
+    // Chercher les intervenants
+    const sheetCompta = ss.getSheetByName("CODE COMPTA");
+    let intervenants = "À définir";
+    if (sheetCompta) {
+      const colM       = sheetCompta.getRange("M:M").getValues();
+      const colQ       = sheetCompta.getRange("Q:Q").getValues();
+      const normaliser = s => String(s).trim().toLowerCase().replace(/\s+/g, " ");
+      const lignes     = [];
+      for (let i = 0; i < colM.length; i++) {
+        if (normaliser(colM[i][0]) === normaliser(nomProjet) && colQ[i][0]) {
+          lignes.push(String(colQ[i][0]).trim());
+        }
+      }
+      if (lignes.length > 0) intervenants = lignes.join(", ");
+    }
+
+    const token      = Utilities.getUuid();
+    const aujourdhui = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd/MM/yyyy");
+
+    PropertiesService.getScriptProperties().setProperty(
+      "CONTRAT_" + token,
+      JSON.stringify({
+        nomProjet, dateDebut, dateFin, nbRepresen,
+        heures, tarifHeure, honoraires,
+        prixCession, fraisHeberg, fraisResto, fraisDeplac, fraisMediation, totalContrat,
+        raisonSociale, siret, formeJuridique, adresse, codePostal, ville,
+        telephone, signataire, qualite, emailOrga, intervenants,
+        aujourdhui, reference, ssId: ss.getId(), ligne: row,
+      })
+    );
+
+    const pageUrl = CONFIG.WEBAPP_URL + "?contrat=" + token;
+
+    MailApp.sendEmail({
+      to:      CONFIG.DROPBOX_SIGN_EMAIL_NOTIF,
+      subject: "[À VALIDER] Contrat de Cession — " + nomProjet + " (" + reference + ")",
+      body:
+`Bonjour,
+
+Un nouveau contrat de cession est prêt à être validé.
+
+Projet       : ${nomProjet}
+Référence    : ${reference}
+Dates        : Du ${dateDebut} au ${dateFin}
+Organisateur : ${raisonSociale} — ${signataire} (${qualite})
+Montant      : ${totalContrat.toFixed(2)} €
+
+Lien de validation :
+${pageUrl}
+
+Cordialement,
+Script automatique AMIIS`,
+    });
+
+    Logger.log("📄 Contrat prêt : " + pageUrl);
+
+  } catch (err) {
+    Logger.log("❌ genererContratCession : " + err.message);
+  }
+}
+
+// ============================================================
+//  PAGE DE VALIDATION DU CONTRAT
+// ============================================================
+
+function afficherContratValidation(token) {
+  const propVal = PropertiesService.getScriptProperties().getProperty("CONTRAT_" + token);
+  if (!propVal) {
+    return HtmlService.createHtmlOutput(
+      `<html><body style="font-family:Arial;text-align:center;padding:60px;">
+        <h2 style="color:#991b1b;">Ce lien est expiré ou déjà validé.</h2>
+      </body></html>`
+    );
+  }
+
+  const d = JSON.parse(propVal);
+  const lignesPrix = buildLignesPrixHTML(d);
+  const logoB64    = getLogoRuminantesB64();
+
+  const html = buildContratValidationHTML(d, lignesPrix, logoB64, token);
+  return HtmlService.createHtmlOutput(html)
+    .setTitle("Contrat — " + d.nomProjet)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function buildLignesPrixHTML(d) {
+  return [
+    d.honoraires    > 0 ? `<tr><td class="lbl">Honoraires médiation (${d.heures}h × ${parseFloat(d.tarifHeure).toFixed(2)} €)</td><td class="amt">${parseFloat(d.honoraires).toFixed(2)} €</td></tr>` : "",
+    d.prixCession   > 0 ? `<tr><td class="lbl">Prix de Cession</td><td class="amt">${d.prixCession.toFixed(2)} €</td></tr>` : "",
+    d.fraisHeberg   > 0 ? `<tr><td class="lbl">Frais d'hébergement</td><td class="amt">${d.fraisHeberg.toFixed(2)} €</td></tr>` : "",
+    d.fraisResto    > 0 ? `<tr><td class="lbl">Frais de restauration</td><td class="amt">${d.fraisResto.toFixed(2)} €</td></tr>` : "",
+    d.fraisDeplac   > 0 ? `<tr><td class="lbl">Frais de déplacement</td><td class="amt">${d.fraisDeplac.toFixed(2)} €</td></tr>` : "",
+    d.fraisMediation > 0 ? `<tr><td class="lbl">Frais de médiation</td><td class="amt">${d.fraisMediation.toFixed(2)} €</td></tr>` : "",
+  ].join("");
+}
+
+function buildContratValidationHTML(d, lignesPrix, logoB64, token) {
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>Contrat — ${d.nomProjet}</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:Georgia,serif;font-size:13px;color:#1a1a1a;background:#f0efe9;line-height:1.65;}
+  .vbar{background:#1a1a1a;color:#fff;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;}
+  .vbar-title{font-family:Arial,sans-serif;font-size:12px;font-weight:700;}
+  .vbar-ref{font-family:Arial,sans-serif;font-size:11px;opacity:.7;margin-top:2px;}
+  .btn-ok{background:#22c55e;color:#fff;border:none;padding:11px 22px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;}
+  .btn-ko{background:#ef4444;color:#fff;border:none;padding:11px 16px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;margin-left:8px;}
+  .page{max-width:820px;margin:20px auto;background:#fff;padding:32px 40px;}
+  @media(max-width:600px){.page{margin:10px;padding:20px 16px;}}
+  .entete{display:flex;justify-content:space-between;align-items:center;padding-bottom:12px;border-bottom:1.5px solid #1a1a1a;margin-bottom:16px;}
+  .entete img{height:50px;object-fit:contain;max-width:160px;}
+  .entete-titre{text-align:right;}
+  .entete-titre .t1{font-family:Arial,sans-serif;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:2px;}
+  .entete-titre .t2{font-family:Arial,sans-serif;font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:#666;margin-top:1px;}
+  .entete-titre .t3{font-family:Arial,sans-serif;font-size:9px;color:#bbb;margin-top:5px;padding-top:5px;border-top:0.5px solid #ddd;}
+  .intro{font-style:italic;font-size:12px;color:#555;margin-bottom:10px;}
+  .parties{display:flex;gap:14px;margin-bottom:14px;}
+  @media(max-width:500px){.parties{flex-direction:column;}}
+  .partie{flex:1;padding:10px 12px;border-top:2px solid #1a1a1a;background:#f8f7f4;font-size:12px;line-height:1.65;}
+  .partie .pnom{font-family:Arial,sans-serif;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px;}
+  .art-titre{font-family:Arial,sans-serif;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:2px;border-bottom:0.5px solid #ccc;padding-bottom:3px;margin:14px 0 7px;}
+  p{margin:3px 0;font-size:12px;line-height:1.65;}
+  ul{margin:4px 0 4px 16px;font-size:12px;line-height:1.65;}
+  .tinfo{width:100%;border-collapse:collapse;margin:6px 0;font-size:11.5px;}
+  .tinfo td{padding:4px 9px;border-bottom:0.5px solid #ddd;}
+  .tinfo td.lbl{font-family:Arial,sans-serif;font-weight:700;width:36%;color:#555;background:#f2f1ed;border-right:0.5px solid #ddd;}
+  .tprix{width:100%;border-collapse:collapse;margin:6px 0;border:0.5px solid #ddd;font-size:11.5px;}
+  .tprix td{padding:4px 9px;border-bottom:0.5px solid #ddd;}
+  .lbl{font-family:Arial,sans-serif;font-weight:700;color:#555;background:#f2f1ed;border-right:0.5px solid #ddd;}
+  .amt{text-align:right;width:110px;}
+  .tprix .tot td{background:#1a1a1a;color:#fff;font-family:Arial,sans-serif;font-weight:700;font-size:12px;border:none;padding:6px 9px;}
+  .fait{font-size:12px;color:#444;margin:18px 0 16px;}
+  .sigs{display:flex;gap:40px;margin-top:8px;}
+  @media(max-width:500px){.sigs{flex-direction:column;gap:24px;}}
+  .sig{flex:1;}
+  .sig-titre{font-family:Arial,sans-serif;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:3px;}
+  .sig-nom{font-size:12px;font-weight:bold;color:#222;}
+  .sig-qual{font-size:11px;color:#999;font-style:italic;margin-bottom:3px;}
+  .sig-lue{font-size:10px;color:#ccc;font-style:italic;margin-bottom:44px;}
+  .sig-ligne{border-top:0.5px solid #1a1a1a;padding-top:4px;font-family:Arial,sans-serif;font-size:9px;color:#bbb;text-align:center;letter-spacing:1px;}
+  .footer-mention{text-align:center;font-family:Arial,sans-serif;font-size:9px;color:#ccc;margin-top:16px;padding-top:8px;border-top:0.5px solid #e8e8e0;}
+  .success{display:none;text-align:center;padding:60px 20px;}
+  .success h2{color:#166534;font-size:20px;margin-bottom:10px;font-family:Arial,sans-serif;}
+</style>
+</head>
+<body>
+<div class="vbar" id="validBar">
+  <div>
+    <div class="vbar-title">${d.nomProjet}</div>
+    <div class="vbar-ref">${d.reference} — Vérifiez puis validez</div>
+  </div>
+  <div>
+    <button class="btn-ok" onclick="valider()">Valider et générer le PDF</button>
+    <button class="btn-ko" onclick="if(confirm('Annuler ce contrat ?')) refuser()">Annuler</button>
+  </div>
+</div>
+
+<div id="contratZone">
+<div class="page">
+  <div class="entete">
+    <img src="${logoB64}" alt="Les Ruminantes"/>
+    <div class="entete-titre">
+      <div class="t1">Contrat de Cession</div>
+      <div class="t2">du droit d'exploitation d'un spectacle</div>
+      <div class="t3">Réf. ${d.reference} — ${d.aujourdhui}</div>
+    </div>
+  </div>
+
+  <div class="intro">Entre les soussignés :</div>
+  <div class="parties">
+    <div class="partie">
+      <div class="pnom">Collectif Les Ruminantes</div>
+      17 route des frères Darrigade, 40180 Narrosse<br/>
+      SIRET : 90197246300011 — APE : 9001 Z<br/>
+      Licence entrepreneur de spectacles 2 : PLATESV-D-2021-005146<br/>
+      Représentée par <strong>Jocelyne Lasserre</strong>, Présidente<br/>
+      <em style="font-size:10px;color:#999;">Ci-après dénommé le Producteur</em>
+    </div>
+    <div class="partie">
+      <div class="pnom">L'Organisateur</div>
+      <strong>${d.raisonSociale}</strong> — ${d.formeJuridique}<br/>
+      ${d.adresse}, ${d.codePostal} ${d.ville}<br/>
+      SIRET : ${d.siret} — Tél. ${d.telephone}<br/>
+      Représentée par <strong>${d.signataire}</strong>, ${d.qualite}<br/>
+      <em style="font-size:10px;color:#999;">Ci-après dénommé l'Organisateur</em>
+    </div>
+  </div>
+
+  <div class="art-titre">1. Droit</div>
+  <p>Le Producteur dispose du droit de représentation en France du spectacle suivant :</p>
+  <table class="tinfo">
+    <tr><td class="lbl">Titre du spectacle</td><td>${d.nomProjet} <em style="color:#aaa;font-size:10px;">réf. ${d.reference}</em></td></tr>
+    <tr><td class="lbl">Dates</td><td>Du ${d.dateDebut} au ${d.dateFin} · ${d.nbRepresen} représentation(s)</td></tr>
+    <tr><td class="lbl">Lieu</td><td>${d.ville} — ${d.raisonSociale}</td></tr>
+    <tr><td class="lbl">Distribution</td><td>${d.intervenants}</td></tr>
+  </table>
+
+  <div class="art-titre">2. Obligation du Producteur</div>
+  <p>Le Producteur fournira le spectacle entièrement monté et assumera la responsabilité artistique des représentations. En qualité d'employeur, il assurera les rémunérations de son personnel attaché au spectacle.</p>
+
+  <div class="art-titre">3. Obligations de l'Organisateur</div>
+  <p>L'Organisateur fournira le lieu de la représentation en ordre de marche, y compris le personnel nécessaire. Il assurera le service général : location, accueil, billetterie, encaissement et service de sécurité. En qualité d'employeur, il assurera les rémunérations de ce personnel. Il aura à sa charge les droits d'auteur et la taxe fiscale sur les spectacles.</p>
+
+  <div class="art-titre">4. Promotion / Publicité</div>
+  <p>Les articles 7 et 8 du décret N°2000-609 du 29 juin 2000 portent obligation de faire figurer les numéros de licence sur les affiches, prospectus, billetterie et contrats. Lorsque la représentation est publique, l'organisateur s'engage à transmettre au producteur tout matériel de promotion non fourni par le producteur et devra obtenir son accord avant diffusion.</p>
+
+  <div class="art-titre">5. Prix</div>
+  <p>L'Organisateur s'engage à verser au Producteur, sur présentation de facture :</p>
+  <table class="tprix">
+    ${lignesPrix}
+    <tr class="tot"><td class="lbl">Total net de TVA</td><td class="amt">${d.totalContrat.toFixed(2)} €</td></tr>
+  </table>
+
+  <div class="art-titre">6. Paiement</div>
+  <p>Le règlement sera effectué si possible le jour de la représentation, sinon à réception de facture : par mandat administratif, chèque à l'ordre de Collectif les Ruminantes, ou virement bancaire via CHORUS PRO.</p>
+
+  <div class="art-titre">7. Assurances</div>
+  <p>Le Producteur assure son personnel et ses équipements. L'Organisateur déclare avoir souscrit les assurances responsabilité civile nécessaires.</p>
+
+  <div class="art-titre">8. Montage - Démontage – Répétitions</div>
+  <p>L'Organisateur tiendra le lieu à disposition pour les répétitions, dont au moins une sur site le jour de la représentation.</p>
+
+  <div class="art-titre">9. Repas & Hébergement</div>
+  <p>En fonction de l'heure de la représentation, les repas et l'hébergement seront à la charge de l'organisateur. Les repas devront inclure une option végétarienne.</p>
+
+  <div class="art-titre">10. Intempéries et Solution de Repli</div>
+  <p>En cas d'intempéries, l'Organisateur proposera une solution de repli sécurisée. À défaut, le spectacle sera réputé dû et la totalité du montant de l'article 5 restera acquise au Producteur.</p>
+
+  <div class="art-titre">11. Annulation</div>
+  <p>Hors cas de force majeure :</p>
+  <ul>
+    <li>Annulation jusqu'à <strong>30 jours</strong> avant : <strong>aucune indemnité</strong></li>
+    <li>Annulation jusqu'à <strong>10 jours</strong> avant : <strong>50% du montant TTC</strong></li>
+    <li>Annulation jusqu'à <strong>2 jours</strong> avant : <strong>100% du montant TTC</strong></li>
+  </ul>
+  <p style="margin-top:6px;">Le présent contrat est établi en deux exemplaires et devra être retourné dans un délai de 8 jours (48h si la date est inférieure à 8 jours).</p>
+
+  <p class="fait">Fait à Narrosse, le ${d.aujourdhui}</p>
+  <div class="sigs">
+    <div class="sig">
+      <div class="sig-titre">Le Producteur</div>
+      <div class="sig-nom">Jocelyne Lasserre</div>
+      <div class="sig-qual">Présidente — Collectif Les Ruminantes</div>
+      <div class="sig-lue">Lu et approuvé</div>
+      <div class="sig-ligne">Signature</div>
+    </div>
+    <div class="sig">
+      <div class="sig-titre">L'Organisateur</div>
+      <div class="sig-nom">${d.signataire}</div>
+      <div class="sig-qual">${d.qualite} — ${d.raisonSociale}</div>
+      <div class="sig-lue">Lu et approuvé</div>
+      <div class="sig-ligne">Signature et cachet</div>
+    </div>
+  </div>
+  <div class="footer-mention">Contrat généré automatiquement — AMIIS / Collectif Les Ruminantes</div>
+</div>
+</div>
+
+<div class="success" id="successZone">
+  <h2>Contrat validé !</h2>
+  <p>Le PDF a été généré et envoyé.<br/>Vous pouvez fermer cette page.</p>
+</div>
+
+<script>
+  const TOKEN  = "${token}";
+  const WEBAPP = "${CONFIG.WEBAPP_URL}";
+
+  function valider() {
+    if (!confirm("Valider et générer le PDF de ce contrat ?")) return;
+    const btn = document.querySelector(".btn-ok");
+    btn.disabled = true;
+    btn.textContent = "Génération en cours...";
+    google.script.run
+      .withSuccessHandler(function(r) {
+        if (r && r.ok) {
+          document.getElementById("contratZone").style.display = "none";
+          document.getElementById("validBar").style.display    = "none";
+          document.getElementById("successZone").style.display = "block";
+        } else {
+          alert("Erreur : " + (r ? r.error : "inconnue"));
+          btn.disabled = false;
+          btn.textContent = "Valider et générer le PDF";
+        }
+      })
+      .withFailureHandler(function(err) {
+        alert("Erreur : " + err.message);
+        btn.disabled = false;
+        btn.textContent = "Valider et générer le PDF";
+      })
+      .validerContratDepuisPage(TOKEN);
+  }
+
+  function refuser() {
+    google.script.run
+      .withSuccessHandler(function() {
+        document.body.innerHTML = "<div style='text-align:center;padding:60px;font-family:Arial;'><h2 style='color:#991b1b;'>Contrat annulé.</h2></div>";
+      })
+      .annulerContratDepuisPage(TOKEN);
+  }
+</script>
+</body></html>`;
+}
+
+// ============================================================
+//  VALIDATION DU CONTRAT — génère le PDF et écrit le lien col AG
+// ============================================================
+
+function validerEtGenererContrat(token) {
+  try {
+    const propKey = "CONTRAT_" + token;
+    const propVal = PropertiesService.getScriptProperties().getProperty(propKey);
+    if (!propVal) return jsonResponse({ ok: false, error: "Token invalide ou déjà utilisé" });
+
+    const d = JSON.parse(propVal);
+    const lignesPrix = buildLignesPrixHTML(d);
+    const logoB64    = getLogoRuminantesB64();
+    const html       = buildContratPDFHTML(d, lignesPrix, logoB64);
+
+    const pdfBlob = htmlToPDF(html, "Contrat_Cession_" + d.reference + "_" + d.nomProjet);
+    const pdfFile = sauvegarderFichierDrive(pdfBlob, new Date().getFullYear().toString());
+    pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    const pdfUrl = pdfFile.getUrl();
+
+    // Écrire le lien en colonne AG (33)
+    const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+    if (sheet && d.ligne) {
+      const richText = SpreadsheetApp.newRichTextValue()
+        .setText("📄 Contrat " + d.reference)
+        .setLinkUrl(pdfUrl)
+        .build();
+      sheet.getRange(d.ligne, 33).setRichTextValue(richText);
+      Logger.log("🔗 Lien contrat écrit col AG ligne " + d.ligne);
+    }
+
+    PropertiesService.getScriptProperties().deleteProperty(propKey);
+    Logger.log("✅ Contrat validé : " + d.reference);
+    return jsonResponse({ ok: true });
+
+  } catch (err) {
+    Logger.log("❌ validerEtGenererContrat : " + err.message);
+    return jsonResponse({ ok: false, error: err.message });
+  }
+}
+
+// ============================================================
+//  HTML DU CONTRAT POUR PDF (version imprimable sans boutons)
+// ============================================================
+
+function buildContratPDFHTML(d, lignesPrix, logoB64) {
+  const useLogo = logoB64 && logoB64.length > 100 ? logoB64 : "";
+  return `<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8"/>
+<style>
+  @page { margin:10mm 14mm; }
+  body{font-family:Arial,sans-serif;font-size:8pt;color:#1a1a1a;margin:0;padding:0;line-height:1.35;}
+  table{border-collapse:collapse;width:100%;}
+  td{vertical-align:top;padding:2px 5px;}
+  h2{font-family:Arial,sans-serif;font-size:7.5pt;font-weight:700;text-transform:uppercase;letter-spacing:1px;border-bottom:0.5px solid #ccc;padding-bottom:1px;margin:7px 0 3px;}
+  p{margin:1px 0;font-size:8pt;line-height:1.35;}
+  ul{margin:2px 0 2px 14px;font-size:8pt;}
+  .partie-box{border-top:1.5px solid #1a1a1a;background:#f8f7f4;padding:5px 8px;font-size:8pt;}
+  .partie-nom{font-size:7pt;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px;}
+  .data-table td{padding:2px 6px;border-bottom:0.5px solid #ddd;font-size:8pt;}
+  .data-table td.lbl{font-weight:700;width:38%;color:#555;background:#f2f1ed;border-right:0.5px solid #ddd;}
+  .prix-table td{padding:2px 6px;border-bottom:0.5px solid #ddd;font-size:8pt;}
+  .prix-table td.lbl{font-weight:700;color:#555;background:#f2f1ed;border-right:0.5px solid #ddd;}
+  .prix-table td.amt{text-align:right;width:100px;}
+  .prix-table tr.total td{background:#1a1a1a;color:#fff;font-weight:700;font-size:8pt;border:none;padding:4px 6px;}
+  .sig-zone{border-top:0.5px solid #1a1a1a;padding-top:2px;font-size:7pt;color:#bbb;text-align:center;}
+</style></head><body>
+
+<table style="border-bottom:1.5px solid #1a1a1a;margin-bottom:8px;padding-bottom:6px;">
+  <tr>
+    <td style="width:50%;vertical-align:middle;">
+      ${useLogo ? `<img src="${useLogo}" alt="Les Ruminantes" style="height:38px;max-width:130px;"/>` : "<strong>Collectif Les Ruminantes</strong>"}
+    </td>
+    <td style="text-align:right;vertical-align:middle;">
+      <div style="font-size:8pt;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;">Contrat de Cession</div>
+      <div style="font-size:8pt;text-transform:uppercase;letter-spacing:1px;color:#666;">du droit d'exploitation d'un spectacle</div>
+      <div style="font-size:8pt;color:#bbb;margin-top:4px;padding-top:4px;border-top:0.5px solid #ddd;">Réf. ${d.reference} — ${d.aujourdhui}</div>
+    </td>
+  </tr>
+</table>
+
+<p style="font-style:italic;font-size:9pt;color:#555;margin-bottom:8px;">Entre les soussignés :</p>
+
+<table style="margin-bottom:7px;">
+  <tr>
+    <td style="width:49%;padding-right:8px;">
+      <div class="partie-box">
+        <div class="partie-nom">Collectif Les Ruminantes</div>
+        17 route des frères Darrigade, 40180 Narrosse<br/>
+        SIRET : 90197246300011 — APE : 9001 Z<br/>
+        Licence entrepreneur de spectacles 2 : PLATESV-D-2021-005146<br/>
+        Représentée par <strong>Jocelyne Lasserre</strong>, Présidente<br/>
+        <em style="font-size:8pt;color:#999;">Ci-après dénommé le Producteur</em>
+      </div>
+    </td>
+    <td style="width:2%;"></td>
+    <td style="width:49%;">
+      <div class="partie-box">
+        <div class="partie-nom">L'Organisateur</div>
+        <strong>${d.raisonSociale}</strong> — ${d.formeJuridique}<br/>
+        ${d.adresse}, ${d.codePostal} ${d.ville}<br/>
+        SIRET : ${d.siret} — Tél. ${d.telephone}<br/>
+        Représentée par <strong>${d.signataire}</strong>, ${d.qualite}<br/>
+        <em style="font-size:8pt;color:#999;">Ci-après dénommé l'Organisateur</em>
+      </div>
+    </td>
+  </tr>
+</table>
+
+<h2>1. Droit</h2>
+<table class="data-table" style="margin:5px 0 8px;border:0.5px solid #ddd;">
+  <tr><td class="lbl">Titre</td><td>${d.nomProjet} <em style="color:#aaa;font-size:8pt;">réf. ${d.reference}</em></td></tr>
+  <tr><td class="lbl">Dates</td><td>Du ${d.dateDebut} au ${d.dateFin} · ${d.nbRepresen} représentation(s)</td></tr>
+  <tr><td class="lbl">Lieu</td><td>${d.ville} — ${d.raisonSociale}</td></tr>
+  <tr><td class="lbl">Distribution</td><td>${d.intervenants}</td></tr>
+</table>
+
+<h2>2. Obligation du Producteur</h2>
+<p>Le Producteur fournira le spectacle entièrement monté et assumera la responsabilité artistique. En qualité d'employeur, il assurera les rémunérations de son personnel.</p>
+
+<h2>3. Obligations de l'Organisateur</h2>
+<p>L'Organisateur fournira le lieu en ordre de marche avec le personnel nécessaire. Il assurera le service général (location, accueil, billetterie, sécurité) et les rémunérations de ce personnel. Il aura à sa charge les droits d'auteur et la taxe fiscale sur les spectacles.</p>
+<p>L'accord technique sera effectué selon les besoins du spectacle. Des loges seront mises à disposition des artistes.</p>
+
+<h2>4. Promotion / Publicité</h2>
+<p>Obligation de mentionner les numéros de licence (décret N°2000-609). Tout matériel de communication de l'organisateur devra être validé par le producteur avant diffusion.</p>
+
+<h2>5. Prix</h2>
+<table class="prix-table" style="margin:5px 0 4px;border:0.5px solid #ddd;">
+  ${lignesPrix}
+  <tr class="total"><td class="lbl">Total net de TVA</td><td class="amt">${d.totalContrat.toFixed(2)} €</td></tr>
+</table>
+
+<h2>6. Paiement</h2>
+<p>Règlement le jour de la représentation ou à réception de facture : mandat administratif, chèque à l'ordre de Collectif les Ruminantes, ou virement bancaire via CHORUS PRO.</p>
+
+<h2>7. Assurances</h2>
+<p>Le Producteur assure son personnel et ses équipements. L'Organisateur déclare avoir souscrit les assurances responsabilité civile nécessaires.</p>
+
+<h2>8. Montage - Démontage – Répétitions</h2>
+<p>L'Organisateur tiendra le lieu à disposition pour les répétitions, dont au moins une sur site le jour de la représentation.</p>
+
+<h2>9. Repas & Hébergement</h2>
+<p>En fonction de l'heure, repas et hébergement à la charge de l'organisateur. Les repas devront inclure une option végétarienne.</p>
+
+<h2>10. Intempéries et Solution de Repli</h2>
+<p>L'organisateur proposera une solution de repli sécurisée en cas d'intempéries. À défaut, la totalité du montant de l'article 5 restera acquise au Producteur.</p>
+
+<h2>11. Annulation</h2>
+<p>Hors cas de force majeure :</p>
+<ul>
+  <li>Jusqu'à <strong>30 jours</strong> avant : <strong>aucune indemnité</strong></li>
+  <li>Jusqu'à <strong>10 jours</strong> avant : <strong>50% du montant TTC</strong></li>
+  <li>Jusqu'à <strong>2 jours</strong> avant : <strong>100% du montant TTC</strong></li>
+</ul>
+<p style="margin-top:4px;">Retour du contrat signé sous 8 jours (48h si date inférieure à 8 jours).</p>
+
+<p style="font-size:8pt;color:#444;margin-top:10px;margin-bottom:8px;">Fait à Narrosse, le ${d.aujourdhui}</p>
+
+<table style="margin-top:8px;">
+  <tr>
+    <td style="width:47%;padding-right:10px;">
+      <div style="font-size:8pt;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:2px;">Le Producteur</div>
+      <div style="font-size:9.5pt;font-weight:bold;color:#222;">Jocelyne Lasserre</div>
+      <div style="font-size:8.5pt;color:#999;font-style:italic;margin-bottom:2px;">Présidente — Collectif Les Ruminantes</div>
+      <div style="font-size:8.5pt;color:#ccc;font-style:italic;margin-bottom:32px;">Lu et approuvé</div>
+      <div class="sig-zone">Signature</div>
+    </td>
+    <td style="width:6%;"></td>
+    <td style="width:47%;">
+      <div style="font-size:8pt;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:2px;">L'Organisateur</div>
+      <div style="font-size:9.5pt;font-weight:bold;color:#222;">${d.signataire}</div>
+      <div style="font-size:8.5pt;color:#999;font-style:italic;margin-bottom:2px;">${d.qualite} — ${d.raisonSociale}</div>
+      <div style="font-size:8.5pt;color:#ccc;font-style:italic;margin-bottom:32px;">Lu et approuvé</div>
+      <div class="sig-zone">Signature et cachet</div>
+    </td>
+  </tr>
+</table>
+
+<div style="text-align:center;font-size:8pt;color:#ccc;margin-top:16px;padding-top:6px;border-top:0.5px solid #e8e8e0;">
+  Contrat généré automatiquement — AMIIS / Collectif Les Ruminantes
+</div>
+</body></html>`;
+}
+
+// ============================================================
+//  LOGO LES RUMINANTES (depuis Drive)
+// ============================================================
+
+function getLogoRuminantesB64() {
+  try {
+    const files = DriveApp.getFilesByName("LOGO_fond_blanc.jpg");
+    if (files.hasNext()) {
+      const b64 = Utilities.base64Encode(files.next().getBlob().getBytes());
+      return "data:image/jpeg;base64," + b64;
+    }
+  } catch (e) {
+    Logger.log("⚠️ Logo Drive introuvable : " + e.message);
+  }
+  return "";
+}
+
+// ============================================================
+//  FONCTIONS APPELÉES DEPUIS LA PAGE HTML (google.script.run)
+// ============================================================
+
+function validerContratDepuisPage(token) {
+  try {
+    const result = validerEtGenererContrat(token);
+    return JSON.parse(result.getContent());
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+function annulerContratDepuisPage(token) {
+  try {
+    PropertiesService.getScriptProperties().deleteProperty("CONTRAT_" + token);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+// ============================================================
+//  PAGE DE SAISIE MANUELLE (upload PDF + formulaire)
+// ============================================================
+
+function afficherPageSaisie() {
+  const logoAmiis = "data:image/png;base64,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";
+
+  const html = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Nouveau devis — AMIIS</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:Arial,sans-serif;background:#f3f4f6;color:#1f2937;font-size:15px;}
+  .header-top{background:#fff;padding:14px 30px;text-align:center;border-bottom:3px solid #e5671a;}
+  .header{background:#1e40af;color:#fff;padding:20px 30px;text-align:center;}
+  .header h1{font-size:20px;margin-bottom:4px;}
+  .header p{font-size:13px;opacity:.8;}
+  .container{max-width:720px;margin:0 auto;padding:28px 20px;}
+  .card{background:#fff;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.08);margin-bottom:22px;overflow:hidden;}
+  .card-title{background:#eff6ff;border-bottom:2px solid #2563eb;padding:12px 20px;font-weight:700;color:#1e40af;font-size:14px;}
+  .upload-zone{padding:30px 20px;text-align:center;border:2px dashed #d1d5db;margin:20px;border-radius:10px;cursor:pointer;transition:border .2s,background .2s;}
+  .upload-zone:hover,.upload-zone.dragover{border-color:#2563eb;background:#eff6ff;}
+  .upload-zone input{display:none;}
+  .upload-icon{font-size:40px;margin-bottom:10px;}
+  .upload-text{color:#6b7280;font-size:14px;}
+  .upload-text strong{color:#1e40af;}
+  .btn-main{display:block;width:calc(100% - 40px);margin:0 20px 20px;padding:14px;background:#1e40af;color:#fff;font-size:15px;font-weight:700;border:none;border-radius:10px;cursor:pointer;transition:background .2s;}
+  .btn-main:hover{background:#1d4ed8;}
+  .btn-main:disabled{background:#9ca3af;cursor:not-allowed;}
+  .btn-submit{display:block;width:100%;padding:15px;background:#16a34a;color:#fff;font-size:16px;font-weight:700;border:none;border-radius:10px;cursor:pointer;margin-top:8px;}
+  .btn-submit:hover{background:#15803d;}
+  .btn-submit:disabled{background:#9ca3af;cursor:not-allowed;}
+  .progress{display:none;padding:16px 20px;}
+  .progress-bar-bg{background:#e5e7eb;border-radius:99px;height:8px;overflow:hidden;margin-top:8px;}
+  .progress-bar{height:8px;border-radius:99px;background:#2563eb;width:0%;transition:width .4s;}
+  .progress-text{font-size:13px;color:#6b7280;margin-bottom:6px;}
+  .form-section{display:none;padding:20px;}
+  .form-group{margin-bottom:16px;}
+  .form-group label{display:block;font-weight:600;color:#374151;margin-bottom:5px;font-size:14px;}
+  .req{color:#ef4444;margin-left:3px;}
+  .form-group input,.form-group select{width:100%;padding:10px 12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:14px;}
+  .form-group input:focus,.form-group select:focus{outline:none;border-color:#2563eb;}
+  .form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+  @media(max-width:500px){.form-row{grid-template-columns:1fr;}}
+  .section-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:#9ca3af;margin:20px 0 12px;padding-top:16px;border-top:1px solid #f3f4f6;}
+  .file-name{margin-top:10px;font-size:13px;color:#2563eb;font-weight:600;display:none;}
+  .success{display:none;text-align:center;padding:60px 20px;}
+  .success h2{color:#166534;font-size:22px;margin-bottom:12px;}
+  .success p{color:#6b7280;font-size:15px;line-height:1.6;}
+</style>
+</head>
+<body>
+
+<div class="header-top">
+  <img src="${logoAmiis}" alt="AMIIS" style="height:55px;object-fit:contain;"/>
+</div>
+<div class="header">
+  <h1>Nouveau devis / contrat</h1>
+  <p>Uploadez le PDF du devis — les informations seront extraites automatiquement</p>
+</div>
+
+<div class="container" id="mainZone">
+
+  <div class="card" id="stepUpload">
+    <div class="card-title">① Uploader le PDF du devis organisateur</div>
+    <div class="upload-zone" id="dropZone" onclick="document.getElementById('pdfInput').click()">
+      <input type="file" id="pdfInput" accept=".pdf" onchange="onFileSelected(this)"/>
+      <div class="upload-icon">📄</div>
+      <div class="upload-text">
+        <strong>Cliquez pour sélectionner</strong> ou glissez-déposez le PDF
+      </div>
+      <div class="file-name" id="fileName"></div>
+    </div>
+    <button class="btn-main" id="btnExtract" onclick="extraireInfos()" disabled>
+      Extraire les informations automatiquement
+    </button>
+    <div class="progress" id="progressZone">
+      <div class="progress-text" id="progressText">Lecture du PDF en cours...</div>
+      <div class="progress-bar-bg"><div class="progress-bar" id="progressBar"></div></div>
+    </div>
+  </div>
+
+  <div class="card" id="stepForm" style="display:none;">
+    <div class="card-title">② Vérifier et compléter les informations</div>
+    <div class="form-section" id="formSection">
+
+      <div class="section-title">🏢 Organisateur</div>
+      <div class="form-group">
+        <label>Raison sociale <span class="req">*</span></label>
+        <input type="text" id="f_raisonSociale" placeholder="Nom de la structure"/>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Forme juridique</label><input type="text" id="f_formeJuridique" placeholder="Association, SARL..."/></div>
+        <div class="form-group"><label>SIRET</label><input type="text" id="f_siret" placeholder="12345678900012"/></div>
+      </div>
+      <div class="form-group"><label>Adresse</label><input type="text" id="f_adresse" placeholder="N° et nom de rue"/></div>
+      <div class="form-row">
+        <div class="form-group"><label>Code postal</label><input type="text" id="f_codePostal" placeholder="40000"/></div>
+        <div class="form-group"><label>Ville</label><input type="text" id="f_ville" placeholder="Mont-de-Marsan"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Téléphone</label><input type="text" id="f_telephone" placeholder="06 00 00 00 00"/></div>
+        <div class="form-group"><label>Email organisateur</label><input type="email" id="f_emailOrga" placeholder="contact@structure.fr"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Signataire</label><input type="text" id="f_signataire" placeholder="Prénom Nom"/></div>
+        <div class="form-group"><label>Qualité</label><input type="text" id="f_qualite" placeholder="Directeur, Président..."/></div>
+      </div>
+
+      <div class="section-title">🎭 Projet</div>
+      <div class="form-group">
+        <label>Nom du projet <span class="req">*</span></label>
+        <input type="text" id="f_nomProjet"/>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Date de début</label><input type="date" id="f_dateDebut"/></div>
+        <div class="form-group"><label>Date de fin</label><input type="date" id="f_dateFin"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Type</label>
+          <select id="f_typeSpectacle">
+            <option value="">-- choisir --</option>
+            <option value="Spectacle">Spectacle</option>
+            <option value="Médiation">Médiation</option>
+            <option value="Spectacle + Médiation">Spectacle + Médiation</option>
+          </select>
+        </div>
+        <div class="form-group"><label>Nombre de représentations</label><input type="number" id="f_nbRepresen" min="0" placeholder="1"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Nombre d'heures facturées</label><input type="number" id="f_heures" min="0" step="0.5" placeholder="0"/></div>
+        <div class="form-group"><label>Tarif horaire (€)</label><input type="number" id="f_tarifHeure" min="0" step="0.01" placeholder="0"/></div>
+      </div>
+
+      <div class="section-title">💰 Montants</div>
+      <div class="form-row">
+        <div class="form-group"><label>Prix de cession (€)</label><input type="number" id="f_prixCession" min="0" step="0.01" placeholder="0"/></div>
+        <div class="form-group"><label>Frais hébergement (€)</label><input type="number" id="f_fraisHeberg" min="0" step="0.01" placeholder="0"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Frais restauration (€)</label><input type="number" id="f_fraisResto" min="0" step="0.01" placeholder="0"/></div>
+        <div class="form-group"><label>Frais déplacement (€)</label><input type="number" id="f_fraisDeplac" min="0" step="0.01" placeholder="0"/></div>
+      </div>
+      <div class="form-group"><label>Frais médiation / petit matériel (€)</label><input type="number" id="f_fraisMediation" min="0" step="0.01" placeholder="0"/></div>
+
+      <div class="section-title">📝 Contrat</div>
+      <div class="form-group">
+        <label>Rédiger un contrat de cession ?</label>
+        <select id="f_rediger"><option value="Non">Non</option><option value="Oui">Oui</option></select>
+      </div>
+
+      <!-- Clé Drive du PDF — ne pas modifier -->
+      <input type="hidden" id="hiddenTempKey" value=""/>
+
+      <button class="btn-submit" id="btnSubmit" onclick="soumettre()" disabled>⏳ En attente du PDF...</button>
+    </div>
+  </div>
+</div>
+
+<div class="success" id="successZone">
+  <h2>✅ Devis créé avec succès !</h2>
+  <p>Les informations ont été enregistrées.<br/>Le récap DPAE a été généré et envoyé au porteur.</p>
+</div>
+
+<script>
+// ── champ caché qui stocke la clé Drive du PDF ──────────────
+// On l'écrit dans un input hidden pour être sûr qu'il
+// est sérialisé correctement dans le payload JSON.
+function getTempPdfKey()  { return document.getElementById("hiddenTempKey").value; }
+function setTempPdfKey(k) { document.getElementById("hiddenTempKey").value = k; }
+
+// Drag & drop
+const dropZone = document.getElementById("dropZone");
+dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
+dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+dropZone.addEventListener("drop", e => {
+  e.preventDefault(); dropZone.classList.remove("dragover");
+  const f = e.dataTransfer.files[0];
+  if (f && f.type === "application/pdf") processFile(f);
+});
+
+function onFileSelected(input) { if (input.files[0]) processFile(input.files[0]); }
+
+function processFile(file) {
+  document.getElementById("fileName").textContent = "📎 " + file.name;
+  document.getElementById("fileName").style.display = "block";
+  // Bloquer le bouton Valider tant que le PDF n'est pas stocké
+  document.getElementById("btnSubmit").disabled = true;
+  document.getElementById("btnSubmit").textContent = "⏳ Stockage du PDF en cours...";
+
+  const reader = new FileReader();
+  reader.onload = e => {
+    const base64 = e.target.result.split(",")[1];
+
+    // Étape 1 : stocker le PDF en Drive, récupérer la clé
+    document.getElementById("progressZone").style.display = "block";
+    setProgress(10, "Stockage du PDF en Drive...");
+
+    google.script.run
+      .withSuccessHandler(function(key) {
+        // Clé stockée dans le champ caché — garantit la persistance
+        setTempPdfKey(key);
+        console.log("✅ tempPdfKey reçue : " + key);
+
+        // Débloquer le bouton Valider
+        document.getElementById("btnSubmit").disabled = false;
+        document.getElementById("btnSubmit").textContent = "✅ Valider et créer le devis";
+        document.getElementById("btnExtract").disabled = false;
+
+        // Étape 2 : lancer l'extraction OCR
+        extraireInfosAvecBase64(base64);
+      })
+      .withFailureHandler(function(err) {
+        setProgress(0, "Erreur stockage PDF : " + err.message);
+        document.getElementById("btnSubmit").disabled = false;
+        document.getElementById("btnSubmit").textContent = "✅ Valider et créer le devis";
+        alert("Erreur stockage PDF : " + err.message);
+      })
+      .stockerPDFTemporaire(base64);
+  };
+  reader.readAsDataURL(file);
+}
+
+function setProgress(pct, text) {
+  document.getElementById("progressBar").style.width = pct + "%";
+  document.getElementById("progressText").textContent = text;
+}
+
+function extraireInfosAvecBase64(base64) {
+  const btn = document.getElementById("btnExtract");
+  btn.disabled = true;
+  btn.textContent = "Extraction en cours...";
+  document.getElementById("progressZone").style.display = "block";
+  setProgress(30, "Analyse du PDF par l'IA...");
+
+  const key = getTempPdfKey();
+  console.log("extraireInfos — tempPdfKey = '" + key + "'");
+
+  google.script.run
+    .withSuccessHandler(function(data) {
+      setProgress(100, "Informations extraites !");
+      if (data.ok && data.infos) {
+        fillForm(data.infos);
+        setTimeout(() => {
+          document.getElementById("progressZone").style.display = "none";
+          document.getElementById("stepForm").style.display = "block";
+          document.getElementById("formSection").style.display = "block";
+          document.getElementById("stepForm").scrollIntoView({ behavior: "smooth" });
+          btn.textContent = "✅ Extraction terminée";
+        }, 600);
+      } else {
+        setProgress(0, "Extraction partielle — remplissez manuellement.");
+        document.getElementById("stepForm").style.display = "block";
+        document.getElementById("formSection").style.display = "block";
+        btn.disabled = false;
+        btn.textContent = "Réessayer";
+      }
+    })
+    .withFailureHandler(function(err) {
+      setProgress(0, "Erreur extraction : " + err.message);
+      btn.disabled = false;
+      btn.textContent = "Réessayer";
+    })
+    .extraireInfosPDFDepuisPage(base64, key);
+}
+
+function fillForm(infos) {
+  const map = {
+    f_raisonSociale: infos.raisonSociale, f_formeJuridique: infos.formeJuridique,
+    f_siret: infos.siret, f_adresse: infos.adresse, f_codePostal: infos.codePostal,
+    f_ville: infos.ville, f_telephone: infos.telephone, f_emailOrga: infos.emailOrga,
+    f_signataire: infos.signataire, f_qualite: infos.qualite, f_nomProjet: infos.nomProjet,
+    f_dateDebut: infos.dateDebut, f_dateFin: infos.dateFin,
+    f_nbRepresen: infos.nbRepresen || "", f_heures: infos.heures || "",
+    f_tarifHeure: infos.tarifHeure || "", f_prixCession: infos.prixCession || "",
+    f_fraisHeberg: infos.fraisHeberg || "", f_fraisResto: infos.fraisResto || "",
+    f_fraisDeplac: infos.fraisDeplac || "",
+  };
+  for (const [id, val] of Object.entries(map)) {
+    const el = document.getElementById(id);
+    if (el && val !== null && val !== undefined) el.value = val;
+  }
+  if (infos.typeSpectacle) {
+    const sel = document.getElementById("f_typeSpectacle");
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === infos.typeSpectacle) { sel.selectedIndex = i; break; }
+    }
+  }
+}
+
+function soumettre() {
+  const key = getTempPdfKey();
+  console.log("soumettre — tempPdfKey = '" + key + "'");
+  if (!key) {
+    alert("Le PDF n'a pas encore été stocké. Veuillez patienter ou re-uploader le fichier.");
+    return;
+  }
+  const btn = document.getElementById("btnSubmit");
+  btn.disabled = true;
+  btn.textContent = "Envoi en cours...";
+
+  const payload = {
+    tempPdfKey: key,
+    raisonSociale:  document.getElementById("f_raisonSociale").value,
+    formeJuridique: document.getElementById("f_formeJuridique").value,
+    siret:          document.getElementById("f_siret").value,
+    adresse:        document.getElementById("f_adresse").value,
+    codePostal:     document.getElementById("f_codePostal").value,
+    ville:          document.getElementById("f_ville").value,
+    telephone:      document.getElementById("f_telephone").value,
+    emailOrga:      document.getElementById("f_emailOrga").value,
+    signataire:     document.getElementById("f_signataire").value,
+    qualite:        document.getElementById("f_qualite").value,
+    nomProjet:      document.getElementById("f_nomProjet").value,
+    dateDebut:      document.getElementById("f_dateDebut").value,
+    dateFin:        document.getElementById("f_dateFin").value,
+    typeSpectacle:  document.getElementById("f_typeSpectacle").value,
+    nbRepresen:     document.getElementById("f_nbRepresen").value,
+    heures:         document.getElementById("f_heures").value,
+    tarifHeure:     document.getElementById("f_tarifHeure").value,
+    prixCession:    document.getElementById("f_prixCession").value,
+    fraisHeberg:    document.getElementById("f_fraisHeberg").value,
+    fraisResto:     document.getElementById("f_fraisResto").value,
+    fraisDeplac:    document.getElementById("f_fraisDeplac").value,
+    fraisMediation: document.getElementById("f_fraisMediation").value,
+    rediger:        document.getElementById("f_rediger").value,
+  };
+
+  google.script.run
+    .withSuccessHandler(function(data) {
+      if (data.ok) {
+        document.getElementById("mainZone").style.display    = "none";
+        document.getElementById("successZone").style.display = "block";
+      } else {
+        alert("Erreur : " + (data.error || "inconnue"));
+        btn.disabled = false;
+        btn.textContent = "✅ Valider et créer le devis";
+      }
+    })
+    .withFailureHandler(function(err) {
+      alert("Erreur : " + err.message);
+      btn.disabled = false;
+      btn.textContent = "✅ Valider et créer le devis";
+    })
+    .soumettreFormulaireDepuisPage(payload);
+}
+</script>
+</body></html>`;
+
+  return HtmlService.createHtmlOutput(html)
+    .setTitle("Nouveau devis — AMIIS")
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// ============================================================
+//  STOCKER LE PDF TEMPORAIREMENT EN DRIVE
+//  Retourne une clé string pour retrouver le fichier ensuite
+// ============================================================
+
+function stockerPDFTemporaire(base64) {
+  try {
+    const pdfBytes = Utilities.base64Decode(base64);
+    const pdfBlob  = Utilities.newBlob(pdfBytes, "application/pdf", "_tmp_devis.pdf");
+    const tmpFile  = DriveApp.getFolderById(CONFIG.DRIVE_FOLDER_ID).createFile(pdfBlob);
+    const key      = "PDF_TMP_" + Utilities.getUuid();
+    PropertiesService.getScriptProperties().setProperty(key, tmpFile.getId());
+    Logger.log("📦 PDF temporaire stocké : " + tmpFile.getId() + " | clé : " + key);
+    return key;
+  } catch (err) {
+    Logger.log("❌ stockerPDFTemporaire : " + err.message);
+    throw err;
+  }
+}
+
+// ============================================================
+//  EXTRACTION PDF VIA OCR DRIVE + GROQ
+//  Accepte soit un base64 (premier appel), soit une clé tempPdfKey
+// ============================================================
+
+function extraireInfosPDFDepuisPage(base64, tempPdfKey) {
+  const result = extraireInfosPDF(base64, tempPdfKey);
+  return JSON.parse(result.getContent());
+}
+
+function extraireInfosPDF(base64, tempPdfKey) {
+  try {
+    Logger.log("extraireInfosPDF — extraction texte via OCR Drive");
+
+    // ── Récupérer le blob PDF ─────────────────────────────────
+    // On préfère récupérer le fichier déjà stocké en Drive (via tempPdfKey)
+    // pour éviter de re-transmettre le base64. Fallback sur le base64 direct.
+    let pdfBlob = null;
+
+    if (tempPdfKey) {
+      const fileId = PropertiesService.getScriptProperties().getProperty(tempPdfKey);
+      if (fileId) {
+        try {
+          pdfBlob = DriveApp.getFileById(fileId).getBlob().copyBlob();
+          pdfBlob.setName("_tmp_ocr_input.pdf");
+          Logger.log("Blob récupéré depuis Drive fileId=" + fileId);
+        } catch (e) {
+          Logger.log("⚠️ Impossible de lire le fichier Drive : " + e.message);
+        }
+      }
+    }
+
+    if (!pdfBlob && base64) {
+      pdfBlob = Utilities.newBlob(Utilities.base64Decode(base64), "application/pdf", "_tmp_ocr_input.pdf");
+      Logger.log("Blob construit depuis base64 (" + base64.length + " chars)");
+    }
+
+    if (!pdfBlob) throw new Error("Aucun PDF disponible pour l'extraction.");
+
+    // ── Upload en Google Doc via DriveApp (OCR natif) ─────────
+    // DriveApp.createFile() avec conversion vers Google Doc déclenche l'OCR.
+    const oauthToken = ScriptApp.getOAuthToken();
+
+    // Créer le fichier PDF temporaire dans Drive
+    const tmpPdfFile = DriveApp.getFolderById(CONFIG.DRIVE_FOLDER_ID).createFile(pdfBlob);
+    const tmpPdfId   = tmpPdfFile.getId();
+    Logger.log("PDF temporaire créé pour OCR : " + tmpPdfId);
+
+    // Copier en Google Doc (déclenche la conversion OCR)
+    const copyResp = UrlFetchApp.fetch(
+      "https://www.googleapis.com/drive/v3/files/" + tmpPdfId + "/copy",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + oauthToken,
+          "Content-Type": "application/json",
+        },
+        payload: JSON.stringify({
+          name: "_tmp_ocr_doc",
+          mimeType: "application/vnd.google-apps.document",
+        }),
+        muteHttpExceptions: true,
+      }
+    );
+
+    // Supprimer le PDF temporaire immédiatement
+    tmpPdfFile.setTrashed(true);
+
+    const copyCode = copyResp.getResponseCode();
+    Logger.log("Copy/OCR réponse [" + copyCode + "] : " + copyResp.getContentText().substring(0, 200));
+    if (copyCode !== 200) throw new Error("Conversion OCR échouée [" + copyCode + "] : " + copyResp.getContentText().substring(0, 300));
+
+    const tmpDocId = JSON.parse(copyResp.getContentText()).id;
+    Utilities.sleep(3000); // Laisser le temps à l'OCR de se terminer
+
+    // Exporter le Doc en texte brut
+    const exportResp = UrlFetchApp.fetch(
+      "https://www.googleapis.com/drive/v3/files/" + tmpDocId + "/export?mimeType=text/plain",
+      { headers: { "Authorization": "Bearer " + oauthToken }, muteHttpExceptions: true }
+    );
+    const pdfText = exportResp.getContentText("UTF-8");
+
+    // Supprimer le Doc temporaire
+    UrlFetchApp.fetch("https://www.googleapis.com/drive/v3/files/" + tmpDocId, {
+      method: "DELETE", headers: { "Authorization": "Bearer " + oauthToken }, muteHttpExceptions: true,
+    });
+
+    if (!pdfText || pdfText.trim().length < 20) throw new Error("PDF vide ou non lisible (PDF scanné sans OCR ?).");
+    Logger.log("Texte OCR extrait (" + pdfText.length + " chars) : " + pdfText.substring(0, 300));
+
+    // Appel Groq
+    const prompt = `Voici le texte extrait d'un devis de spectacle vivant.
+Ce document contient deux parties : le PRODUCTEUR (Collectif Les Ruminantes / AMIIS) et l'ORGANISATEUR (le client).
+Extrait UNIQUEMENT les informations de l'ORGANISATEUR.
+Retourne UNIQUEMENT un JSON valide sans markdown, sans backticks. Format exact :
+{"raisonSociale":"","formeJuridique":"","siret":"","adresse":"","codePostal":"","ville":"","telephone":"","emailOrga":"","signataire":"","qualite":"","nomProjet":"","dateDebut":"YYYY-MM-DD","dateFin":"YYYY-MM-DD","typeSpectacle":"","nbRepresen":0,"heures":0,"tarifHeure":0,"prixCession":0,"fraisHeberg":0,"fraisResto":0,"fraisDeplac":0,"fraisMediation":0}
+Si une info est absente : "" ou 0. Pour typeSpectacle : "Spectacle", "Médiation" ou "Spectacle + Médiation".
+TEXTE : ${pdfText}`;
+
+    const groqResp = UrlFetchApp.fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + CONFIG.GROQ_API_KEY },
+      payload: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        messages: [
+          { role: "system", content: "Tu réponds UNIQUEMENT avec un objet JSON valide, sans texte avant ni après." },
+          { role: "user",   content: prompt },
+        ],
+        temperature: 0,
+        max_tokens: 1500,
+        response_format: { type: "json_object" },
+      }),
+      muteHttpExceptions: true,
+    });
+
+    if (groqResp.getResponseCode() !== 200) throw new Error("Groq erreur : " + groqResp.getContentText().substring(0, 200));
+
+    const groqResult = JSON.parse(groqResp.getContentText());
+    const rawText    = groqResult.choices[0].message.content.trim().replace(/```json|```/g, "").trim();
+    const infos      = JSON.parse(rawText);
+    Logger.log("✅ Extraction OK : " + JSON.stringify(infos).substring(0, 200));
+
+    return jsonResponse({ ok: true, infos });
+
+  } catch (err) {
+    Logger.log("❌ extraireInfosPDF : " + err.message);
+    return jsonResponse({ ok: false, error: err.message });
+  }
+}
+
+// ============================================================
+//  TRAITEMENT DU FORMULAIRE DE SAISIE (appelé depuis HTML)
+// ============================================================
+
+function soumettreFormulaireDepuisPage(params) {
+  const result = traiterFormulaireSaisie(params);
+  return JSON.parse(result.getContent());
+}
+
+function traiterFormulaireSaisie(params) {
+  try {
+    Logger.log("traiterFormulaireSaisie démarré");
+    const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+    if (!sheet) throw new Error("Feuille " + CONFIG.SHEET_NAME + " introuvable.");
+
+    const lastRow = sheet.getLastRow() + 1;
+    Logger.log("Écriture ligne " + lastRow);
+
+    // Timestamp col A
+    sheet.getRange(lastRow, 1).setValue(new Date());
+
+    // ── PDF du devis organisateur en colonne D ──────────────────
+    if (params.tempPdfKey) {
+      try {
+        const fileId = PropertiesService.getScriptProperties().getProperty(params.tempPdfKey);
+        if (fileId) {
+          const tmpFile   = DriveApp.getFileById(fileId);
+          const annee     = new Date().getFullYear().toString();
+          const dossierAnnee = getDossierAnnee(annee);
+
+          tmpFile.setName("Devis_" + (params.nomProjet || "document") + ".pdf");
+          tmpFile.moveTo(dossierAnnee);
+          tmpFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+          const richText = SpreadsheetApp.newRichTextValue()
+            .setText("📎 Devis " + (params.nomProjet || ""))
+            .setLinkUrl(tmpFile.getUrl())
+            .build();
+          sheet.getRange(lastRow, CONFIG.COL_PDF_DEVIS).setRichTextValue(richText);
+          SpreadsheetApp.flush();
+
+          PropertiesService.getScriptProperties().deleteProperty(params.tempPdfKey);
+          Logger.log("📎 PDF devis écrit en col D ligne " + lastRow + " : " + tmpFile.getUrl());
+        }
+      } catch (pdfErr) {
+        Logger.log("⚠️ Erreur lien PDF devis : " + pdfErr.message);
+      }
+    }
+    // ── Données projet colonnes E(5) à Q(17) ───────────────────
+    sheet.getRange(lastRow,  5).setValue(params.nomProjet      || "");
+    sheet.getRange(lastRow,  6).setValue(params.dateDebut      || "");
+    sheet.getRange(lastRow,  7).setValue(params.dateFin        || "");
+    sheet.getRange(lastRow,  8).setValue(params.typeSpectacle  || "");
+    sheet.getRange(lastRow,  9).setValue(parseFloat(params.heures)         || 0);
+    sheet.getRange(lastRow, 10).setValue(parseFloat(params.tarifHeure)     || 0);
+    sheet.getRange(lastRow, 11).setValue("");  // médiation liée
+    sheet.getRange(lastRow, 12).setValue(parseFloat(params.nbRepresen)     || 0);
+    sheet.getRange(lastRow, 13).setValue(parseFloat(params.prixCession)    || 0);
+    sheet.getRange(lastRow, 14).setValue(parseFloat(params.fraisHeberg)    || 0);
+    sheet.getRange(lastRow, 15).setValue(parseFloat(params.fraisResto)     || 0);
+    sheet.getRange(lastRow, 16).setValue(parseFloat(params.fraisDeplac)    || 0);
+    sheet.getRange(lastRow, 17).setValue(parseFloat(params.fraisMediation) || 0);
+
+    // Col S(19) — contrat de cession
+    sheet.getRange(lastRow, 19).setValue(params.rediger || "Non");
+
+    // Infos organisateur col T(20) à AC(29)
+    sheet.getRange(lastRow, 20).setValue(params.raisonSociale  || "");
+    sheet.getRange(lastRow, 21).setValue(params.siret          || "");
+    sheet.getRange(lastRow, 22).setValue(params.formeJuridique || "");
+    sheet.getRange(lastRow, 23).setValue(params.adresse        || "");
+    sheet.getRange(lastRow, 24).setValue(params.codePostal     || "");
+    sheet.getRange(lastRow, 25).setValue(params.ville          || "");
+    sheet.getRange(lastRow, 26).setValue(params.telephone      || "");
+    sheet.getRange(lastRow, 27).setValue(params.signataire     || "");
+    sheet.getRange(lastRow, 28).setValue(params.qualite        || "");
+    sheet.getRange(lastRow, 29).setValue(params.emailOrga      || "");
+
+    SpreadsheetApp.flush();
+
+    // Déclencher le traitement principal
+    onFormSubmit({ range: sheet.getRange(lastRow, 1) });
+
+    Logger.log("✅ Formulaire traité ligne " + lastRow);
+    return jsonResponse({ ok: true });
+
+  } catch (err) {
+    Logger.log("❌ traiterFormulaireSaisie : " + err.message);
+    return jsonResponse({ ok: false, error: err.message });
+  }
+}
+
+/** Retourne (ou crée) le sous-dossier de l'année dans le dossier principal. */
+function getDossierAnnee(annee) {
+  const racine = DriveApp.getFolderById(CONFIG.DRIVE_FOLDER_ID);
+  const iter   = racine.getFoldersByName(annee);
+  return iter.hasNext() ? iter.next() : racine.createFolder(annee);
+}
+
+// ============================================================
+//  RAPPELS AUTOMATIQUES
+// ============================================================
+
+function envoyerRappels() {
+  const props    = PropertiesService.getScriptProperties().getProperties();
+  const now      = new Date().getTime();
+  const ss       = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  let nbRappels  = 0;
+
+  for (const key in props) {
+    if (!key.startsWith("TOKEN_")) continue;
+    try {
+      const data           = JSON.parse(props[key]);
+      const dernierRappel  = data.dernierRappel || data.createdAt || 0;
+      if ((now - dernierRappel) / (1000 * 60 * 60 * 24) < 21) continue;
+
+      const sheetCompta = ss.getSheetByName("CODE COMPTA");
+      if (!sheetCompta) continue;
+
+      const normaliser = s => String(s).trim().toLowerCase().replace(/\s+/g, " ");
+      const colM       = sheetCompta.getRange("M:M").getValues();
+      let porteurMail  = null, porteurPrenom = null;
+      for (let i = 0; i < colM.length; i++) {
+        if (normaliser(colM[i][0]) === normaliser(data.nomProjet)) {
+          porteurPrenom = sheetCompta.getRange(i + 1, 20).getValue();
+          porteurMail   = sheetCompta.getRange(i + 1, 21).getValue();
+          break;
+        }
+      }
+      if (!porteurMail) continue;
+
+      const token  = key.replace("TOKEN_", "");
+      const webUrl = CONFIG.WEBAPP_URL + "?token=" + token;
+
+      MailApp.sendEmail({
+        to:      porteurMail,
+        subject: "[RAPPEL] Répartition salariale en attente — " + data.nomProjet + " (" + data.reference + ")",
+        body:
+`Bonjour ${porteurPrenom},
+
+Une déclaration de répartition salariale est en attente pour le projet : ${data.nomProjet}.
+Référence : ${data.reference}
+
+Formulaire : ${webUrl}
+
+Cordialement,
+L'équipe administrative`,
+      });
+
+      data.dernierRappel = now;
+      PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(data));
+      nbRappels++;
+      Logger.log("📧 Rappel envoyé à " + porteurMail);
+
+    } catch (err) {
+      Logger.log("❌ Rappel " + key + " : " + err.message);
+    }
+  }
+  Logger.log("✅ " + nbRappels + " rappel(s) envoyé(s)");
+}
+
+// ============================================================
+//  INSTALLATION DES DÉCLENCHEURS
+// ============================================================
+
+function installTriggerRappel() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "envoyerRappels") ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger("envoyerRappels")
+    .timeBased().everyWeeks(1).onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(9).create();
+  Logger.log("✅ Déclencheur rappels installé (lundi 9h)");
+}
+
+function installTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "onFormSubmit") ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger("onFormSubmit")
+    .forSpreadsheet(SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID))
+    .onFormSubmit().create();
+  SpreadsheetApp.getUi().alert("✅ Déclencheur onFormSubmit installé !");
+}
