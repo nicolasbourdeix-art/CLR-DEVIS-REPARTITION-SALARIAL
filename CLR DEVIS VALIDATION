@@ -496,6 +496,9 @@ function doGet(e) {
   // Page de validation de contrat
   if (e.parameter.contrat) return afficherContratValidation(e.parameter.contrat);
 
+  // URL nue (sans token) : ouvrir la page de saisie plutôt que « lien expiré »
+  if (!e.parameter.token) return afficherPageSaisie();
+
   // Page de répartition salariale
   const token   = e.parameter.token || "";
   const propVal = PropertiesService.getScriptProperties().getProperty("TOKEN_" + token);
